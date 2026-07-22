@@ -179,15 +179,70 @@ paths:
               type: object
               required: [meta, image, thumb]
               properties:
-                meta: { type: string, description: JSON Entry create fields }
+                meta:
+                  type: string
+                  description: >-
+                    JSON Entry create fields. May include clientUploadId
+                    (idempotency key, [A-Za-z0-9._-]{1,128}) — retrying the same
+                    clientUploadId returns 200 with the already-created entry.
                 image: { type: string, format: binary }
                 thumb: { type: string, format: binary }
+                override:
+                  type: string
+                  enum: ["1", "true"]
+                  description: create even when the same image already exists for this account
       responses:
         "201":
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Entry"
+        "200":
+          description: idempotent replay — clientUploadId already created this entry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+        "409":
+          description: >-
+            DUPLICATE_IMAGE — same-owner upload of identical image bytes (resend
+            with override to create anyway). Also plain CONFLICT on entry id reuse.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: { type: string, enum: [DUPLICATE_IMAGE, CONFLICT] }
+                      message: { type: string }
+                  duplicateOf:
+                    type: object
+                    description: present only for DUPLICATE_IMAGE
+                    properties:
+                      id: { type: string }
+                      takenAt: { type: number }
+  /entries/changes:
+    get:
+      security: [{ bearerAuth: [] }]
+      description: >-
+        SSE feed of this account's entry changes (same-account multi-device sync).
+        Auth-only — works while the keyring is locked. Frames: {type:"cursor",seq},
+        {type:"change",seq,entryId,kind:created|updated|deleted},
+        {type:"resync",seq} (cursor not replayable — full refetch),
+        {type:"ping"} heartbeat (~25s). Server closes the stream periodically
+        (~20min); reconnect with ?since=<last seq>.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: integer }
+          description: last seen seq; omitted = live-only with an initial cursor frame
+      responses:
+        "200":
+          content:
+            text/event-stream:
+              schema: { type: string }
   /entries/{id}:
     parameters:
       - $ref: "#/components/parameters/Id"
@@ -601,6 +656,9 @@ components:
               faceIndex: { type: integer }
         unknownFaces: { type: integer }
         faceScannedAt: { type: number }
+        clientUploadId:
+          type: string
+          description: "Client-generated upload idempotency key ('' on legacy rows); immutable"
     EntryPage:
       type: object
       properties:

@@ -8,6 +8,11 @@ final class ApiClient: @unchecked Sendable {
     private let decoder = JSONCoding.decoder
     private let refreshGate = AsyncSemaphore(value: 1)
 
+    /// Fired from the single error chokepoint (`apiError`) whenever a request comes back
+    /// 423 E_KEYS_LOCKED — the server keyring lost this account's keys (restart). Notify-only,
+    /// same as Web's `notifyKeysLocked()`; the caller's request still fails normally.
+    var onKeysLocked: (@Sendable () -> Void)?
+
     init(session: SessionStore) {
         self.session = session
         let config = URLSessionConfiguration.default
@@ -90,9 +95,17 @@ final class ApiClient: @unchecked Sendable {
     }
 
     private func apiError(data: Data, status: Int) -> ApiError {
-        let parsed = try? decoder.decode(ErrorBody.self, from: data).error
+        let parsed = try? decoder.decode(ErrorBody.self, from: data)
+        let code = parsed?.error?.code ?? ""
+        if status == 423 && code == "E_KEYS_LOCKED" { onKeysLocked?() }
         let fallback = String(data: data, encoding: .utf8) ?? HTTPURLResponse.localizedString(forStatusCode: status)
-        return ApiError(status: status, code: parsed?.code ?? "", message: parsed?.message ?? fallback)
+        return ApiError(
+            status: status,
+            code: code,
+            message: parsed?.error?.message ?? fallback,
+            duplicateOfId: parsed?.duplicateOf?.id,
+            duplicateOfTakenAt: parsed?.duplicateOf?.takenAt
+        )
     }
 
     private func requestDecoded<T: Decodable>(
@@ -155,6 +168,50 @@ final class ApiClient: @unchecked Sendable {
         return auth
     }
 
+    @discardableResult
+    func register(
+        accountType: String, username: String, password: String,
+        displayName: String? = nil, familyName: String? = nil, regCode: String? = nil
+    ) async throws -> AuthResponse {
+        var payload: [String: Any] = ["accountType": accountType, "username": username, "password": password]
+        if let displayName, !displayName.isEmpty { payload["displayName"] = displayName }
+        if let familyName, !familyName.isEmpty { payload["familyName"] = familyName }
+        if let regCode, !regCode.isEmpty { payload["regCode"] = regCode }
+        let auth = try await requestDecoded(
+            AuthResponse.self, path: "/api/v1/auth/register", method: "POST",
+            json: payload, authorized: false
+        )
+        session.setSession(access: auth.accessToken, refresh: auth.refreshToken, user: auth.user)
+        return auth
+    }
+
+    /// Valid JWT, empty server keyring (restart): re-enter the password, no logout.
+    @discardableResult
+    func unlock(password: String) async throws -> UnlockResponse {
+        try await requestDecoded(
+            UnlockResponse.self, path: "/api/v1/auth/unlock", method: "POST", json: ["password": password]
+        )
+    }
+
+    @discardableResult
+    func recover(username: String, recoveryCode: String, newPassword: String) async throws -> AuthResponse {
+        let auth = try await requestDecoded(
+            AuthResponse.self, path: "/api/v1/auth/recover", method: "POST",
+            json: ["username": username, "recoveryCode": recoveryCode, "newPassword": newPassword],
+            authorized: false
+        )
+        session.setSession(access: auth.accessToken, refresh: auth.refreshToken, user: auth.user)
+        return auth
+    }
+
+    /// Rotates + reveals a fresh recovery code; the old one dies. Requires the password again.
+    func regenerateRecoveryCode(currentPassword: String) async throws -> String {
+        try await requestDecoded(
+            RecoveryCodeResponse.self, path: "/api/v1/auth/me/recovery-code", method: "POST",
+            json: ["currentPassword": currentPassword]
+        ).recoveryCode
+    }
+
     func logout() async {
         _ = try? await requestDecoded(
             OkResponse.self, path: "/api/v1/auth/logout", method: "POST", json: [:]
@@ -162,8 +219,8 @@ final class ApiClient: @unchecked Sendable {
         session.clearSession()
     }
 
-    func me() async throws -> AuthUser {
-        try await requestDecoded(MeResponse.self, path: "/api/v1/auth/me").user
+    func me() async throws -> MeResponse {
+        try await requestDecoded(MeResponse.self, path: "/api/v1/auth/me")
     }
 
     func changePassword(current: String, next: String) async throws -> AuthResponse {
@@ -173,6 +230,72 @@ final class ApiClient: @unchecked Sendable {
         )
         session.setSession(access: auth.accessToken, refresh: auth.refreshToken, user: auth.user)
         return auth
+    }
+
+    // MARK: - Family
+
+    func fetchFamily() async throws -> FamilyInfo {
+        try await requestDecoded(FamilyInfo.self, path: "/api/v1/family")
+    }
+
+    /// A family account without a family (ops dissolved it) starts a fresh one.
+    @discardableResult
+    func createFamily(name: String? = nil) async throws -> FamilyActionResponse {
+        var payload: [String: Any] = [:]
+        if let name, !name.isEmpty { payload["name"] = name }
+        return try await requestDecoded(FamilyActionResponse.self, path: "/api/v1/family", method: "POST", json: payload)
+    }
+
+    @discardableResult
+    func sendFamilyInvite(username: String) async throws -> FamilyInvite {
+        try await requestDecoded(
+            FamilyInvite.self, path: "/api/v1/family/invites", method: "POST", json: ["username": username]
+        )
+    }
+
+    func revokeFamilyInvite(id: String) async throws {
+        _ = try await requestDecoded(OkResponse.self, path: "/api/v1/family/invites/\(id)", method: "DELETE") as OkResponse
+    }
+
+    func myInvites() async throws -> [MyInvite] {
+        try await requestDecoded(MyInvitePage.self, path: "/api/v1/me/invites").items
+    }
+
+    @discardableResult
+    func acceptInvite(id: String) async throws -> FamilyActionResponse {
+        try await requestDecoded(
+            FamilyActionResponse.self, path: "/api/v1/me/invites/\(id)/accept", method: "POST", json: [:]
+        )
+    }
+
+    func declineInvite(id: String) async throws {
+        _ = try await requestDecoded(
+            OkResponse.self, path: "/api/v1/me/invites/\(id)/decline", method: "POST", json: [:]
+        ) as OkResponse
+    }
+
+    @discardableResult
+    func leaveFamily() async throws -> FamilyActionResponse {
+        try await requestDecoded(FamilyActionResponse.self, path: "/api/v1/me/family/leave", method: "POST", json: [:])
+    }
+
+    func removeFamilyMember(id: String) async throws {
+        _ = try await requestDecoded(OkResponse.self, path: "/api/v1/family/members/\(id)", method: "DELETE") as OkResponse
+    }
+
+    // MARK: - Relationship graph
+
+    func graph() async throws -> GraphResponse {
+        try await requestDecoded(GraphResponse.self, path: "/api/v1/graph")
+    }
+
+    func deleteRelationship(id: String) async throws {
+        let (data, http) = try await send { [self] in
+            try makeRequest(path: "/api/v1/relationships/\(id)", method: "DELETE")
+        }
+        guard (200..<300).contains(http.statusCode) || http.statusCode == 404 else {
+            throw apiError(data: data, status: http.statusCode)
+        }
     }
 
     // MARK: - Entries
@@ -187,7 +310,7 @@ final class ApiClient: @unchecked Sendable {
         try await requestDecoded(Entry.self, path: "/api/v1/entries/\(id)")
     }
 
-    func uploadEntry(meta: Entry, jpeg: Data, thumb: Data) async throws -> Entry {
+    func uploadEntry(meta: Entry, jpeg: Data, thumb: Data, override: Bool = false) async throws -> Entry {
         let boundary = "nx-\(UUID().uuidString)"
         var body = Data()
         func appendField(_ name: String, _ value: Data, filename: String? = nil, mime: String? = nil) {
@@ -204,6 +327,7 @@ final class ApiClient: @unchecked Sendable {
         appendField("meta", metaData)
         appendField("image", jpeg, filename: "image.jpg", mime: "image/jpeg")
         appendField("thumb", thumb, filename: "thumb.jpg", mime: "image/jpeg")
+        if override { appendField("override", Data("1".utf8)) }
         body.append(Data("--\(boundary)--\r\n".utf8))
 
         let (data, http) = try await send { [self] in
@@ -236,6 +360,54 @@ final class ApiClient: @unchecked Sendable {
     func depthJson(entryId: String) async throws -> String {
         let data = try await requestBytes(path: "/api/v1/entries/\(entryId)/depth")
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    // MARK: - Change feed
+
+    /// One GET+SSE connection attempt for the entries change feed; yields decoded frames as they
+    /// arrive. Ends (without throwing) when the server closes the stream cleanly, or throws on
+    /// error — the caller owns reconnect/backoff and the resume cursor across calls.
+    func entryChanges(since: Int64) -> AsyncThrowingStream<ChangeFrame, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    var refreshed = false
+                    while true {
+                        var request = try makeRequest(
+                            path: "/api/v1/entries/changes",
+                            query: [URLQueryItem(name: "since", value: String(since))]
+                        )
+                        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                        request.timeoutInterval = 3600
+                        let (bytes, response) = try await urlSession.bytes(for: request)
+                        guard let http = response as? HTTPURLResponse else {
+                            throw ApiError(status: 0, code: "UNAVAILABLE", message: "无法连接服务器")
+                        }
+                        if http.statusCode == 401, !refreshed, await refreshIfNeeded(status: 401) {
+                            refreshed = true
+                            continue
+                        }
+                        guard (200..<300).contains(http.statusCode) else {
+                            var collected = Data()
+                            for try await byte in bytes { collected.append(byte) }
+                            throw apiError(data: collected, status: http.statusCode)
+                        }
+                        for try await line in bytes.lines {
+                            guard line.hasPrefix("data:") else { continue }
+                            let event = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+                            guard !event.isEmpty, let data = event.data(using: .utf8),
+                                  let frame = try? decoder.decode(ChangeFrame.self, from: data) else { continue }
+                            continuation.yield(frame)
+                        }
+                        continuation.finish()
+                        return
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     // MARK: - Session (canonical)
@@ -331,34 +503,10 @@ final class ApiClient: @unchecked Sendable {
         try await requestBytes(path: "/api/v1/entries/\(entryId)/faces/\(faceIndex)/thumb")
     }
 
-    // MARK: - Admin users
+    // MARK: - Members (family-scoped listing; account CRUD moved to family invites)
 
     func users() async throws -> [AuthUser] {
         try await requestDecoded(UserPage.self, path: "/api/v1/users").items
-    }
-
-    @discardableResult
-    func createUser(username: String, password: String, displayName: String, role: String) async throws -> AuthUser {
-        try await requestDecoded(
-            UserResponse.self, path: "/api/v1/users", method: "POST",
-            json: ["username": username, "password": password, "displayName": displayName, "role": role]
-        ).user
-    }
-
-    @discardableResult
-    func updateUser(
-        id: String,
-        displayName: String? = nil,
-        role: String? = nil,
-        disabled: Bool? = nil,
-        password: String? = nil
-    ) async throws -> AuthUser {
-        var payload: [String: Any] = [:]
-        if let displayName { payload["displayName"] = displayName }
-        if let role { payload["role"] = role }
-        if let disabled { payload["disabled"] = disabled }
-        if let password, !password.isEmpty { payload["password"] = password }
-        return try await requestDecoded(UserResponse.self, path: "/api/v1/users/\(id)", method: "PATCH", json: payload).user
     }
 
     // MARK: - SSE

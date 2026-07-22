@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { ParticleCanvas } from './components/ParticleCanvas';
 import { CursorRing } from './components/CursorRing';
+import { DuplicatePhotoDialog } from './components/DuplicatePhotoDialog';
 import { GraphOverlay } from './components/GraphOverlay';
 import { PeopleOverlay } from './components/PeopleOverlay';
 import { PhotoDissolve } from './components/PhotoDissolve';
@@ -30,6 +31,7 @@ export default function App() {
       <GraphOverlay />
       <ProfileOverlay />
       <UserPickerOverlay />
+      <DuplicatePhotoDialog />
       <Toast />
       <CursorRing />
     </>

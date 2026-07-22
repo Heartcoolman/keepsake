@@ -7,6 +7,7 @@ struct AppRoot: View {
     let engine: ParticleEngine
     @Environment(AppViewModel.self) private var model
     @Environment(ShellState.self) private var shell
+    @Environment(\.scenePhase) private var scenePhase
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
@@ -47,12 +48,35 @@ struct AppRoot: View {
             }
         }
         .overlay { OverlayHost() }
+        .overlay {
+            if model.duplicatePrompt != nil {
+                ConfirmDialog(
+                    title: "照片已存在",
+                    body: "这张照片已经有一条记忆，仍要新建一条吗？",
+                    confirm: "仍新建",
+                    dismissLabel: "跳过",
+                    dismiss: { model.skipDuplicateUpload() }
+                ) {
+                    model.confirmDuplicateUpload()
+                }
+            }
+        }
+        .overlay {
+            if model.locked { UnlockOverlay() }
+        }
+        .overlay {
+            if model.recoveryCode != nil { RecoveryCodeModal() }
+        }
         .onChange(of: model.navigateToSession) { _, navigate in
             if navigate {
                 shell.overlay = nil
                 sessionOpen = true
                 model.consumeSessionNavigation()
             }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            model.handleScenePhaseChange(active: phase == .active)
+            engine.setBackgrounded(phase != .active)
         }
         .onChange(of: shell.closeSessionRequest) {
             if sessionOpen {
@@ -82,7 +106,7 @@ struct AppRoot: View {
             model.sessionTab,
             model.sessionEntry?.mood ?? "",
             String(model.sessionMessages.count),
-            String(model.depthJson?.count ?? 0),
+            String(model.depthVersion),
         ].joined(separator: "|")
     }
 
@@ -101,6 +125,7 @@ struct AppRoot: View {
             photoId: photoId,
             jpeg: sessionOpen ? model.photoBytes : nil,
             depthJson: sessionOpen ? model.depthJson : nil,
+            depthVersion: sessionOpen ? model.depthVersion : 0,
             mode: mode
         ))
         if entrancePhotoId != photoId && photoId == nil { entrancePhotoId = nil }
@@ -389,6 +414,9 @@ struct TimelineToolbar: View {
     var body: some View {
         @Bindable var model = model
         VStack(spacing: 8) {
+            if model.pendingDecisionCount > 0 {
+                PendingDecisionBanner(count: model.pendingDecisionCount) { model.resolvePendingDecisions() }
+            }
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach([("all", "全部"), ("new", "未开始"), ("chatting", "对话中"), ("done", "已成念")], id: \.0) { key, label in
@@ -401,6 +429,7 @@ struct TimelineToolbar: View {
                     NxPill(text: model.sortAscending ? "⇅ 最早" : "⇅ 最近", action: model.toggleSort)
                     NxPill(text: "✦ 回顾", action: { shell.overlay = .review })
                     NxPill(text: "✧ 人物", action: { shell.overlay = .people })
+                    NxPill(text: "◈ 关系图谱", action: { shell.overlay = .graph })
                     NxPill(text: "◐ \(model.user?.displayName ?? "选择使用者")", action: { shell.overlay = .account })
                 }
             }
@@ -492,6 +521,21 @@ private struct TimelineFooter: View {
     }
 }
 
+private struct PendingDecisionBanner: View {
+    let count: Int
+    let resolve: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("\(count) 张照片待确认")
+                .font(.system(size: 12))
+                .foregroundStyle(NxColors.textDim)
+            Spacer()
+            NxPill(text: "去确认", action: resolve)
+        }
+    }
+}
+
 private struct TimelineErrorRow: View {
     let error: String
     @Environment(AppViewModel.self) private var model
@@ -539,33 +583,66 @@ private struct EmptyTimeline: View {
 // MARK: - Auth
 
 struct AuthScreen: View {
+    private enum GateView { case login, register, recover }
+    private enum RegisterAccountType: String { case personal, family }
+
     @Environment(AppViewModel.self) private var model
+    @State private var view: GateView = .login
     @State private var username = ""
     @State private var password = ""
     @State private var displayName = ""
+    @State private var familyName = ""
+    @State private var accountType: RegisterAccountType = .personal
+    @State private var regCode = ""
+    @State private var recoveryInput = ""
     @State private var connectionOpen = false
 
     var body: some View {
         let bootstrap = model.bootstrapped == false
+        let activeView: GateView = bootstrap ? .register : view
+
         NxBackdrop {
             NxPanel {
                 VStack(spacing: 0) {
-                    Text(bootstrap ? "✦ 首次启用" : "✦ 登录念想")
+                    Text(heading(bootstrap: bootstrap, view: activeView))
                         .font(.nxSerif(25))
                         .foregroundStyle(NxColors.text)
-                    Text(bootstrap ? "创建管理员账号，记忆会锁在你的账户下" : "输入用户名与密码")
+                    Text(subheading(bootstrap: bootstrap, view: activeView))
                         .font(.system(size: 12))
                         .foregroundStyle(NxColors.textDim)
                         .multilineTextAlignment(.center)
                         .padding(.top, 7)
                         .padding(.bottom, 22)
-                    if bootstrap {
+
+                    if activeView == .register && !bootstrap {
+                        HStack(spacing: 8) {
+                            NxPill(text: "个人账户", action: { accountType = .personal }, selected: accountType == .personal)
+                            NxPill(text: "家庭账户", action: { accountType = .family }, selected: accountType == .family)
+                        }
+                        .padding(.bottom, 10)
+                    }
+                    if activeView == .register {
                         NxField(placeholder: "怎么称呼你?", text: $displayName, maxLength: 20)
+                            .padding(.bottom, 10)
+                    }
+                    if activeView == .register && !bootstrap && accountType == .family {
+                        NxField(placeholder: "家庭名称 (可选)", text: $familyName, maxLength: 20)
                             .padding(.bottom, 10)
                     }
                     NxField(placeholder: "用户名 (字母数字_)", text: $username, maxLength: 32)
                         .padding(.bottom, 10)
-                    NxField(placeholder: "密码 (至少 8 位)", text: $password, password: true, maxLength: 128)
+                    if activeView == .recover {
+                        NxField(placeholder: "恢复码 (XXXX-XXXX-…)", text: $recoveryInput, maxLength: 48)
+                            .padding(.bottom, 10)
+                    }
+                    NxField(
+                        placeholder: activeView == .recover ? "新密码 (至少 8 位)" : "密码 (至少 8 位)",
+                        text: $password, password: true, maxLength: 128
+                    )
+                    if activeView == .register && !bootstrap {
+                        NxField(placeholder: "注册码 (服务器未设置则留空)", text: $regCode, maxLength: 64)
+                            .padding(.top, 10)
+                    }
                     if let error = model.error {
                         Text(error)
                             .font(.system(size: 12))
@@ -573,18 +650,23 @@ struct AuthScreen: View {
                             .padding(.top, 10)
                     }
                     NxPrimaryButton(
-                        text: model.loading ? "…" : (bootstrap ? "启用 ✦" : "进入 ✦"),
-                        action: {
-                            let name = username.trimmingCharacters(in: .whitespaces)
-                            if bootstrap {
-                                model.bootstrap(username: name, password: password, displayName: displayName.trimmingCharacters(in: .whitespaces))
-                            } else {
-                                model.login(username: name, password: password)
-                            }
-                        },
-                        enabled: !model.loading && !username.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 8
+                        text: model.loading ? "…" : primaryLabel(bootstrap: bootstrap, view: activeView),
+                        action: { submit(bootstrap: bootstrap, view: activeView) },
+                        enabled: canSubmit(view: activeView)
                     )
                     .padding(.top, 18)
+                    if !bootstrap {
+                        HStack(spacing: 14) {
+                            if activeView != .login {
+                                NxPill(text: "返回登录", action: { view = .login })
+                            }
+                            if activeView == .login {
+                                NxPill(text: "注册新账户", action: { view = .register })
+                                NxPill(text: "忘记密码?", action: { view = .recover })
+                            }
+                        }
+                        .padding(.top, 12)
+                    }
                     NxPill(text: "连接设置", action: { connectionOpen = true })
                         .padding(.top, 12)
                 }
@@ -600,13 +682,195 @@ struct AuthScreen: View {
             }
         }
         .onSubmit {
-            let name = username.trimmingCharacters(in: .whitespaces)
-            guard !model.loading, !name.isEmpty, password.count >= 8 else { return }
-            if bootstrap {
-                model.bootstrap(username: name, password: password, displayName: displayName.trimmingCharacters(in: .whitespaces))
-            } else {
-                model.login(username: name, password: password)
+            guard activeView == .login, canSubmit(view: .login) else { return }
+            model.login(username: username.trimmingCharacters(in: .whitespaces), password: password)
+        }
+    }
+
+    private func heading(bootstrap: Bool, view: GateView) -> String {
+        if bootstrap { return "✦ 首次启用" }
+        switch view {
+        case .login: return "✦ 登录念想"
+        case .register: return "✦ 注册账户"
+        case .recover: return "✦ 用恢复码找回"
+        }
+    }
+
+    private func subheading(bootstrap: Bool, view: GateView) -> String {
+        if bootstrap { return "创建第一个家庭账户,记忆将加密存放——连服务器管理者也读不到" }
+        switch view {
+        case .login: return "输入用户名与密码"
+        case .register: return "家庭账户可以创建家庭并邀请他人;个人账户免费独立使用,也能接受家庭邀请"
+        case .recover: return "输入注册时保存的恢复码,并设置新密码"
+        }
+    }
+
+    private func primaryLabel(bootstrap: Bool, view: GateView) -> String {
+        if bootstrap { return "启用 ✦" }
+        switch view {
+        case .login: return "进入 ✦"
+        case .register: return "注册 ✦"
+        case .recover: return "找回 ✦"
+        }
+    }
+
+    private func canSubmit(view: GateView) -> Bool {
+        !model.loading && !username.trimmingCharacters(in: .whitespaces).isEmpty && password.count >= 8
+            && (view != .recover || recoveryInput.trimmingCharacters(in: .whitespaces).count >= 8)
+    }
+
+    private func submit(bootstrap: Bool, view: GateView) {
+        let name = username.trimmingCharacters(in: .whitespaces)
+        guard bootstrap || canSubmit(view: view) else { return }
+        if bootstrap {
+            model.bootstrap(username: name, password: password, displayName: displayName.trimmingCharacters(in: .whitespaces))
+            return
+        }
+        switch view {
+        case .login:
+            model.login(username: name, password: password)
+        case .register:
+            model.register(
+                accountType: accountType.rawValue,
+                username: name,
+                password: password,
+                displayName: displayName.trimmingCharacters(in: .whitespaces),
+                familyName: accountType == .family ? familyName.trimmingCharacters(in: .whitespaces) : "",
+                regCode: regCode.trimmingCharacters(in: .whitespaces)
+            )
+        case .recover:
+            model.recover(
+                username: name,
+                recoveryCode: recoveryInput.trimmingCharacters(in: .whitespaces),
+                newPassword: password
+            )
+        }
+    }
+}
+
+// MARK: - Unlock (423 E_KEYS_LOCKED)
+
+/// Blocking overlay shown whenever the server keyring lost this account's keys (restart).
+/// Not dismissable by tapping outside — only "解锁 ✦" (same session) or "退出登录" (escape).
+struct UnlockOverlay: View {
+    @Environment(AppViewModel.self) private var model
+    @State private var password = ""
+
+    var body: some View {
+        ZStack {
+            Color(argb: 0xE008080C).ignoresSafeArea()
+            NxPanel {
+                VStack(spacing: 0) {
+                    Text("✦ 需要解锁")
+                        .font(.nxSerif(22))
+                        .foregroundStyle(NxColors.text)
+                    Text("服务器重启后,你的加密密钥已从内存清除。输入密码重新解锁\(model.user.map { "(@\($0.username))" } ?? "")。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NxColors.textDim)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 7)
+                        .padding(.bottom, 22)
+                    NxField(placeholder: "密码", text: $password, password: true, maxLength: 128)
+                    if let error = model.error {
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(NxColors.errorColor)
+                            .padding(.top, 10)
+                    }
+                    NxPrimaryButton(
+                        text: model.loading ? "…" : "解锁 ✦",
+                        action: { model.unlock(password: password) },
+                        enabled: !model.loading && password.count >= 8
+                    )
+                    .padding(.top, 18)
+                    NxPill(text: "退出登录", action: model.logout)
+                        .padding(.top, 12)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 28)
             }
+            .frame(maxWidth: 430)
+            .padding(20)
+        }
+    }
+}
+
+// MARK: - Recovery code (one-shot reveal)
+
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
+
+private func copyToClipboard(_ text: String) {
+    #if os(iOS)
+    UIPasteboard.general.string = text
+    #elseif os(macOS)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    #endif
+}
+
+/// One-shot recovery code display — must be explicitly acknowledged (two-tap "已保存"),
+/// it is never shown again. Shared by register/bootstrap/recover/unlock/regenerate.
+struct RecoveryCodeModal: View {
+    @Environment(AppViewModel.self) private var model
+    @State private var copied = false
+    @State private var armed = false
+
+    var body: some View {
+        ZStack {
+            Color(argb: 0xC008080C).ignoresSafeArea()
+            NxPanel {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("✦ 你的恢复码")
+                        .font(.nxSerif(20))
+                        .foregroundStyle(NxColors.text)
+                    Text("忘记密码时,这是找回记忆的唯一方式。请立刻抄写或保存——它不会再次显示,服务器上也没有任何人能帮你找回。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(NxColors.textDim)
+                        .padding(.top, 8)
+                    Text(model.recoveryCode ?? "")
+                        .font(.system(size: 15, design: .monospaced))
+                        .foregroundStyle(NxColors.text)
+                        .textSelection(.enabled)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(argb: 0x14FFFFFF), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(NxColors.line, lineWidth: 1))
+                        .padding(.vertical, 12)
+                    HStack(spacing: 10) {
+                        NxPill(text: copied ? "已复制 ✓" : "复制恢复码", action: copy)
+                        NxPill(text: armed ? "再点一次,确认已保存" : "我已妥善保存 ✦", action: dismiss, selected: true)
+                    }
+                }
+                .padding(20)
+            }
+            .frame(maxWidth: 430)
+            .padding(20)
+        }
+    }
+
+    private func copy() {
+        copyToClipboard(model.recoveryCode ?? "")
+        copied = true
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            copied = false
+        }
+    }
+
+    private func dismiss() {
+        if armed {
+            armed = false
+            model.ackRecoveryCode()
+            return
+        }
+        armed = true
+        Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            armed = false
         }
     }
 }

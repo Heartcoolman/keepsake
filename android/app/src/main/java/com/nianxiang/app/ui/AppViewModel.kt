@@ -8,32 +8,49 @@ import androidx.lifecycle.viewModelScope
 import com.nianxiang.app.NianxiangApp
 import com.nianxiang.app.data.ApiClient
 import com.nianxiang.app.data.ApiException
+import com.nianxiang.app.data.AuthResponse
 import com.nianxiang.app.data.AuthUser
+import com.nianxiang.app.data.ChangeEvent
 import com.nianxiang.app.data.ChatDateParser
 import com.nianxiang.app.data.ChatMessage
 import com.nianxiang.app.data.Entry
 import com.nianxiang.app.data.FaceCluster
 import com.nianxiang.app.data.FaceRef
+import com.nianxiang.app.data.FamilyInfo
+import com.nianxiang.app.data.GraphNode
 import com.nianxiang.app.data.MonthlyReview
+import com.nianxiang.app.data.MyInvite
 import com.nianxiang.app.data.PersonDto
 import com.nianxiang.app.data.ProfileData
+import com.nianxiang.app.data.RelationshipDto
 import com.nianxiang.app.data.SessionStore
+import com.nianxiang.app.data.UploadQueue
+import com.nianxiang.app.data.friendlyError
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonPrimitive
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 data class UiState(
     val baseUrl: String = SessionStore.DEFAULT_BASE_URL,
@@ -53,7 +70,14 @@ data class UiState(
     val monthlyReview: MonthlyReview? = null,
     val monthlyStream: String = "",
     val selectedMonth: String = "",
-    val adminUsers: List<AuthUser> = emptyList(),
+    val locked: Boolean = false,
+    val recoveryCode: String? = null,
+    val familyInfo: FamilyInfo? = null,
+    val myInvites: List<MyInvite> = emptyList(),
+    val familyBusyKey: String? = null,
+    val graphNodes: List<GraphNode> = emptyList(),
+    val graphEdges: List<RelationshipDto> = emptyList(),
+    val graphLoading: Boolean = false,
     val sessionEntry: Entry? = null,
     val sessionMessages: List<ChatMessage> = emptyList(),
     val diaryStream: String = "",
@@ -67,6 +91,9 @@ data class UiState(
     val photoBytes: ByteArray? = null,
     val depthJson: String? = null,
     val navigateToSession: Boolean = false,
+    val duplicatePrompt: Boolean = false,
+    val pendingDecisionCount: Int = 0,
+    val pendingDecisionPrompt: Boolean = false,
 )
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -86,6 +113,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** 月报加载/生成协程，切换月份时取消，避免旧月份响应写回当前月份。 */
     private var monthlyJob: Job? = null
 
+    /** Pending duplicate-image decision from importPhotos, resolved by the UI's confirm dialog. */
+    private var duplicateDecision: CompletableDeferred<Boolean>? = null
+
+    /** Pending decision while walking needs_decision items from resolvePendingDecisions(). */
+    private var pendingWalkDecision: CompletableDeferred<Boolean>? = null
+
+    /** Serializes all upload-queue drains/decision-walks so the queue directory is never touched concurrently. */
+    private val drainMutex = Mutex()
+
+    /** Collects connectivity changes only while foreground; started/stopped by onAppForeground/onAppBackground. */
+    private var connectivityJob: Job? = null
+
+    /** True between onAppForeground() and onAppBackground(); gates the change feed alongside login state. */
+    private var isForeground = false
+
+    /** Change-feed subscription; runs only while logged in and foreground. */
+    private var changeFeedJob: Job? = null
+
+    /** Last seq seen from the change feed, resumed across reconnects; reset on logout. */
+    private var lastChangeSeq: Long = 0L
+
+    /** One tick per "change" frame; coalesced into a single loadHome() by the collector started in init. */
+    private val changeSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 64)
+
     private fun cancelSessionJobs() {
         sessionLoadJob?.cancel()
         sessionLoadJob = null
@@ -103,6 +154,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
+        startChangeCoalescer()
+        // Server restarted and lost its in-memory keys: only ready sessions flip to locked
+        // (mirrors Web's onKeysLocked — a login/register/recover in flight isn't "ready" yet).
+        viewModelScope.launch {
+            api.keysLocked.collect {
+                if (_state.value.user != null) _state.update { it.copy(locked = true) }
+            }
+        }
         viewModelScope.launch {
             // DataStore/Keystore 读取失败一律视为未登录，绝不让异常从启动协程冒泡导致崩溃循环。
             val url = runCatching { session.getBaseUrl() }.getOrDefault(SessionStore.DEFAULT_BASE_URL)
@@ -112,9 +171,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val access = runCatching { session.getAccess() }.getOrNull()
             if (access != null) {
                 runCatching { api.me() }
-                    .onSuccess { u ->
-                        _state.update { it.copy(user = u) }
-                        loadHome()
+                    .onSuccess { me ->
+                        _state.update { it.copy(user = me.user, locked = me.locked) }
+                        // Locked: skip data calls (they'd just 423) until unlock() succeeds.
+                        if (!me.locked) {
+                            loadHome()
+                            drainQueue(interactive = false)
+                            startChangeFeed()
+                        }
                     }
                     .onFailure { e ->
                         // 只有服务器明确拒绝鉴权（401/403，且 ApiClient 内部已重试过刷新）
@@ -126,8 +190,92 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         } else if (storedUser != null) {
                             _state.update { s -> s.copy(error = e.message) }
                             loadHome()
+                            drainQueue(interactive = false)
+                            startChangeFeed()
                         }
                     }
+            }
+        }
+    }
+
+    /** Drain + change-feed triggers: app returns to foreground, and connectivity regained while foreground. */
+    fun onAppForeground() {
+        isForeground = true
+        viewModelScope.launch { drainQueue(interactive = false) }
+        startChangeFeed()
+        if (connectivityJob == null) {
+            connectivityJob = viewModelScope.launch {
+                container.connectivity.isOnline.collect { online ->
+                    if (online) {
+                        drainQueue(interactive = false)
+                        // Share the reconnect trigger: don't wait out the change feed's own backoff.
+                        restartChangeFeed()
+                    }
+                }
+            }
+        }
+    }
+
+    fun onAppBackground() {
+        isForeground = false
+        connectivityJob?.cancel()
+        connectivityJob = null
+        stopChangeFeed()
+    }
+
+    /** Starts the change-feed subscription if not already running and both gates (login, foreground) hold. */
+    private fun startChangeFeed() {
+        if (!isForeground || _state.value.user == null || changeFeedJob != null) return
+        changeFeedJob = viewModelScope.launch {
+            var backoffMs = CHANGE_FEED_BACKOFF_MIN_MS
+            while (true) {
+                val error = runCatching {
+                    var connected = false
+                    api.changeFeed(lastChangeSeq).collect { event ->
+                        if (!connected) {
+                            connected = true
+                            backoffMs = CHANGE_FEED_BACKOFF_MIN_MS // reset as soon as a connection succeeds
+                        }
+                        if (event.seq > 0) lastChangeSeq = event.seq
+                        when (event.type) {
+                            "change" -> changeSignal.tryEmit(Unit)
+                            "resync" -> loadHome(clearError = false)
+                        }
+                    }
+                }.exceptionOrNull()
+                if (error is CancellationException) throw error
+                if (error != null) {
+                    delay(backoffMs)
+                    backoffMs = (backoffMs * 2).coerceAtMost(CHANGE_FEED_BACKOFF_MAX_MS)
+                }
+                // else: server closed the stream cleanly (~20min) -> loop immediately, no backoff
+            }
+        }
+    }
+
+    private fun stopChangeFeed() {
+        changeFeedJob?.cancel()
+        changeFeedJob = null
+    }
+
+    private fun restartChangeFeed() {
+        stopChangeFeed()
+        startChangeFeed()
+    }
+
+    /** Coalesces "change" frames into a single loadHome(): flush after 1s quiet or 3s max wait since the first. */
+    private fun startChangeCoalescer() {
+        viewModelScope.launch {
+            while (true) {
+                changeSignal.first()
+                val batchStart = System.currentTimeMillis()
+                while (true) {
+                    val remaining = CHANGE_MAX_WAIT_MS - (System.currentTimeMillis() - batchStart)
+                    if (remaining <= 0) break
+                    val gotMore = withTimeoutOrNull(minOf(CHANGE_DEBOUNCE_MS, remaining)) { changeSignal.first() }
+                    if (gotMore == null) break
+                }
+                loadHome(clearError = false)
             }
         }
     }
@@ -151,30 +299,90 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun login(username: String, password: String) = authAction {
-        api.login(username, password).user
+    fun login(username: String, password: String) = authAction(
+        fallback = "登录失败",
+        overrides = mapOf("UNAUTHORIZED" to "用户名或密码不正确"),
+    ) { api.login(username, password) }
+
+    fun bootstrap(username: String, password: String, displayName: String) = authAction(
+        fallback = "初始化失败",
+        overrides = mapOf(
+            "CONFLICT" to "用户名已被占用",
+            "VALIDATION" to "用户名需 3-32 位字母/数字/下划线,密码至少 8 位",
+        ),
+    ) { api.bootstrap(username, password, displayName) }
+
+    fun register(
+        accountType: String,
+        username: String,
+        password: String,
+        displayName: String,
+        familyName: String,
+        regCode: String,
+    ) = authAction(
+        fallback = "注册失败",
+        overrides = mapOf(
+            "CONFLICT" to "用户名已被占用",
+            "VALIDATION" to "用户名需 3-32 位字母/数字/下划线,密码至少 8 位",
+        ),
+    ) {
+        api.register(
+            accountType = accountType,
+            username = username,
+            password = password,
+            displayName = displayName.ifBlank { null },
+            familyName = if (accountType == "family") familyName.ifBlank { null } else null,
+            regCode = regCode.ifBlank { null },
+        )
     }
 
-    fun bootstrap(username: String, password: String, displayName: String) = authAction {
-        api.bootstrap(username, password, displayName).user
+    fun recover(username: String, recoveryCode: String, newPassword: String) = authAction(
+        fallback = "找回失败",
+        overrides = mapOf(
+            "UNAUTHORIZED" to "恢复码不正确",
+            "NOT_FOUND" to "用户名不存在",
+        ),
+    ) { api.recover(username, recoveryCode, newPassword) }
+
+    /** Server restarted and lost its in-memory keys: same session, no logout. */
+    fun unlock(password: String) {
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            runCatching { api.unlock(password) }
+                .onSuccess { res ->
+                    _state.update { it.copy(loading = false, locked = false, recoveryCode = res.recoveryCode) }
+                    loadHome()
+                    drainQueue(interactive = false)
+                    startChangeFeed()
+                }
+                .onFailure { e ->
+                    val msg = friendlyError(e, "解锁失败", mapOf("UNAUTHORIZED" to "密码不正确")) ?: "解锁失败"
+                    _state.update { it.copy(loading = false, error = msg) }
+                }
+        }
     }
 
-    private fun authAction(block: suspend () -> AuthUser) {
+    private fun authAction(fallback: String, overrides: Map<String, String> = emptyMap(), block: suspend () -> AuthResponse) {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             runCatching { block() }
-                .onSuccess { u ->
-                    _state.update { it.copy(user = u, loading = false) }
+                .onSuccess { res ->
+                    _state.update {
+                        it.copy(user = res.user, recoveryCode = res.recoveryCode, loading = false, locked = false)
+                    }
                     loadHome()
+                    startChangeFeed()
                 }
                 .onFailure { e ->
-                    _state.update { it.copy(loading = false, error = e.message) }
+                    _state.update { it.copy(loading = false, error = friendlyError(e, fallback, overrides) ?: fallback) }
                 }
         }
     }
 
     fun logout() {
         cancelSessionJobs()
+        stopChangeFeed()
+        lastChangeSeq = 0L
         viewModelScope.launch {
             api.logout()
             thumbnailCache.evictAll()
@@ -512,13 +720,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Every picked photo is persisted to the offline queue BEFORE any network attempt, then drained. */
     fun importPhotos(uris: List<Uri>) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null, uploadProgress = "0/${uris.size}") }
-            var last: Entry? = null
-            var failures = 0
-            var firstFailure: String? = null
+            var prepFailures = 0
+            var firstPrepFailure: String? = null
             uris.forEachIndexed { index, uri ->
                 runCatching {
                     val photo = container.photoImporter.prepare(uri)
@@ -534,34 +742,213 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         title = "未命名记忆",
                         userId = _state.value.user?.id.orEmpty(),
                         ownerId = _state.value.user?.id.orEmpty(),
+                        clientUploadId = UUID.randomUUID().toString(),
                     )
-                    api.uploadEntry(entry, photo.jpeg, photo.thumb)
-                }.onSuccess { created -> last = created }
-                    .onFailure { error ->
-                        failures++
-                        if (firstFailure == null) firstFailure = error.message ?: error::class.simpleName ?: "未知错误"
-                    }
+                    container.uploadQueue.enqueue(entry, photo.jpeg, photo.thumb)
+                }.onFailure { error ->
+                    prepFailures++
+                    if (firstPrepFailure == null) firstPrepFailure = error.message ?: error::class.simpleName ?: "未知错误"
+                }
                 _state.update { it.copy(uploadProgress = "${index + 1}/${uris.size}") }
             }
-            _state.update {
-                val summary = if (failures == 0) {
-                    "已上传 ${uris.size} 张"
-                } else {
-                    "${uris.size - failures} 张成功，$failures 张失败：${firstFailure ?: "请重试"}"
-                }
-                it.copy(
-                    loading = false,
-                    uploadProgress = "",
-                    error = firstFailure,
-                    toast = summary,
-                )
+            _state.update { it.copy(uploadProgress = "") }
+            drainQueue(interactive = true, extraFailures = prepFailures, extraFirstFailure = firstPrepFailure)
+            _state.update { it.copy(loading = false) }
+        }
+    }
+
+    /**
+     * Drains all queued items sequentially: uploads (reusing the stored clientUploadId so
+     * server-side retries dedup), removes on success, and applies HTTP-error/duplicate/network
+     * semantics per item. Guarded by [drainMutex] so only one drain runs at a time.
+     */
+    private suspend fun drainQueue(interactive: Boolean, extraFailures: Int = 0, extraFirstFailure: String? = null) {
+        drainMutex.withLock {
+            val result = runDrainLocked(interactive)
+            val failCount = result.failCount + extraFailures
+            val firstFailure = result.firstFailure ?: extraFirstFailure
+            refreshPendingDecisionCount()
+            val processed = result.successCount + result.skipCount + failCount
+            if (processed > 0) {
+                _state.update { it.showToast(drainSummary(result.successCount, result.skipCount, failCount, firstFailure)) }
             }
-            loadHome(clearError = false)
-            last?.let { created ->
-                _state.update { it.copy(sessionEntry = created, navigateToSession = true) }
-                openEntry(created)
+            if (result.successCount > 0) {
+                loadHome(clearError = false)
+                if (interactive) {
+                    result.lastUploaded?.let { created ->
+                        _state.update { it.copy(sessionEntry = created, navigateToSession = true) }
+                        openEntry(created)
+                    }
+                }
             }
         }
+    }
+
+    private data class DrainResult(
+        val successCount: Int = 0,
+        val skipCount: Int = 0,
+        val failCount: Int = 0,
+        val firstFailure: String? = null,
+        val lastUploaded: Entry? = null,
+    )
+
+    private suspend fun runDrainLocked(interactive: Boolean): DrainResult {
+        val queue = container.uploadQueue
+        val pending = queue.list().filter { it.state == UploadQueue.STATE_PENDING }
+        if (pending.isEmpty()) return DrainResult()
+        var successCount = 0
+        var skipCount = 0
+        var failCount = 0
+        var firstFailure: String? = null
+        var lastUploaded: Entry? = null
+        for ((index, manifest) in pending.withIndex()) {
+            _state.update { it.copy(uploadProgress = "${index + 1}/${pending.size}") }
+            val jpeg = queue.loadImage(manifest.clientUploadId)
+            val thumb = queue.loadThumb(manifest.clientUploadId)
+            if (jpeg == null || thumb == null) {
+                queue.remove(manifest.clientUploadId)
+                failCount++
+                if (firstFailure == null) firstFailure = "文件已丢失"
+                continue
+            }
+            try {
+                val uploaded = api.uploadEntry(manifest.entry, jpeg, thumb)
+                queue.remove(manifest.clientUploadId)
+                successCount++
+                lastUploaded = uploaded
+            } catch (e: ApiException) {
+                when {
+                    // Server keyring is empty (restart): the unlock overlay will take over via
+                    // the api.keysLocked hook — leave this item pending, don't count it as a
+                    // failure or toast about it.
+                    e.code == "E_KEYS_LOCKED" -> break
+                    e.code == "DUPLICATE_IMAGE" && interactive -> {
+                        if (confirmDuplicateUpload()) {
+                            try {
+                                val uploaded = api.uploadEntry(manifest.entry, jpeg, thumb, override = true)
+                                queue.remove(manifest.clientUploadId)
+                                successCount++
+                                lastUploaded = uploaded
+                            } catch (e2: ApiException) {
+                                queue.remove(manifest.clientUploadId)
+                                failCount++
+                                if (firstFailure == null) firstFailure = e2.message
+                            } catch (e2: IOException) {
+                                break // network dropped mid-decision; stays queued for a later drain
+                            }
+                        } else {
+                            queue.remove(manifest.clientUploadId)
+                            skipCount++
+                        }
+                    }
+                    e.code == "DUPLICATE_IMAGE" -> queue.updateState(manifest.clientUploadId, UploadQueue.STATE_NEEDS_DECISION)
+                    else -> {
+                        val attempts = queue.incrementAttempts(manifest.clientUploadId)
+                        failCount++
+                        if (firstFailure == null) firstFailure = e.message
+                        if (attempts >= UploadQueue.MAX_ATTEMPTS) queue.remove(manifest.clientUploadId)
+                    }
+                }
+            } catch (e: IOException) {
+                break // network-layer failure: stop draining, remaining items stay pending for later
+            }
+        }
+        _state.update { it.copy(uploadProgress = "") }
+        return DrainResult(successCount, skipCount, failCount, firstFailure, lastUploaded)
+    }
+
+    private fun drainSummary(success: Int, skip: Int, fail: Int, firstFailure: String?): String {
+        if (fail == 0 && skip == 0) return "已上传 $success 张"
+        return buildString {
+            append("$success 张成功")
+            if (skip > 0) append("，$skip 张重复已跳过")
+            if (fail > 0) append("，$fail 张失败：${firstFailure ?: "请重试"}")
+        }
+    }
+
+    private fun refreshPendingDecisionCount() {
+        val count = container.uploadQueue.list().count { it.state == UploadQueue.STATE_NEEDS_DECISION }
+        _state.update { it.copy(pendingDecisionCount = count) }
+    }
+
+    /** Walks queued needs_decision items (from automatic drains) through the same confirm dialog. */
+    fun resolvePendingDecisions() {
+        viewModelScope.launch {
+            drainMutex.withLock {
+                val queue = container.uploadQueue
+                val items = queue.list().filter { it.state == UploadQueue.STATE_NEEDS_DECISION }
+                if (items.isEmpty()) return@withLock
+                var successCount = 0
+                var skipCount = 0
+                var failCount = 0
+                var firstFailure: String? = null
+                var lastUploaded: Entry? = null
+                for (manifest in items) {
+                    val decision = CompletableDeferred<Boolean>()
+                    pendingWalkDecision = decision
+                    _state.update { it.copy(pendingDecisionPrompt = true) }
+                    val createAnyway = decision.await()
+                    pendingWalkDecision = null
+                    _state.update { it.copy(pendingDecisionPrompt = false) }
+                    if (!createAnyway) {
+                        queue.remove(manifest.clientUploadId)
+                        skipCount++
+                        continue
+                    }
+                    val jpeg = queue.loadImage(manifest.clientUploadId)
+                    val thumb = queue.loadThumb(manifest.clientUploadId)
+                    if (jpeg == null || thumb == null) {
+                        queue.remove(manifest.clientUploadId)
+                        failCount++
+                        continue
+                    }
+                    try {
+                        val uploaded = api.uploadEntry(manifest.entry, jpeg, thumb, override = true)
+                        queue.remove(manifest.clientUploadId)
+                        successCount++
+                        lastUploaded = uploaded
+                    } catch (e: ApiException) {
+                        queue.remove(manifest.clientUploadId)
+                        failCount++
+                        if (firstFailure == null) firstFailure = e.message
+                    } catch (e: IOException) {
+                        break // network dropped mid-decision; item stays needs_decision for another tap
+                    }
+                }
+                refreshPendingDecisionCount()
+                val processed = successCount + skipCount + failCount
+                if (processed > 0) _state.update { it.showToast(drainSummary(successCount, skipCount, failCount, firstFailure)) }
+                if (successCount > 0) {
+                    loadHome(clearError = false)
+                    lastUploaded?.let { created ->
+                        _state.update { it.copy(sessionEntry = created, navigateToSession = true) }
+                        openEntry(created)
+                    }
+                }
+            }
+        }
+    }
+
+    /** Called by the UI's confirm dialog while walking needs_decision items. */
+    fun resolvePendingDecisionChoice(createAnyway: Boolean) {
+        pendingWalkDecision?.complete(createAnyway)
+    }
+
+    private suspend fun confirmDuplicateUpload(): Boolean {
+        val decision = CompletableDeferred<Boolean>()
+        duplicateDecision = decision
+        _state.update { it.copy(duplicatePrompt = true) }
+        return try {
+            decision.await()
+        } finally {
+            duplicateDecision = null
+            _state.update { it.copy(duplicatePrompt = false) }
+        }
+    }
+
+    /** Called by the UI's confirm dialog: true = create anyway, false = skip this photo. */
+    fun resolveDuplicatePrompt(createAnyway: Boolean) {
+        duplicateDecision?.complete(createAnyway)
     }
 
     fun consumeSessionNavigation() {
@@ -715,36 +1102,77 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun loadUsers() {
-        if (_state.value.user?.role != "admin") return
-        viewModelScope.launch {
-            runCatching { api.users() }
-                .onSuccess { users -> _state.update { it.copy(adminUsers = users) } }
-                .onFailure { e -> _state.update { it.copy(error = e.message) } }
-        }
-    }
-
-    fun createUser(username: String, password: String, displayName: String, role: String) {
-        viewModelScope.launch {
-            runCatching { api.createUser(username, password, displayName, role) }
-                .onSuccess { loadUsers(); _state.update { it.showToast("成员已创建") } }
-                .onFailure { e -> _state.update { it.copy(error = e.message).showToast("创建失败") } }
-        }
-    }
-
-    fun updateUser(id: String, name: String, role: String, disabled: Boolean, password: String? = null) {
-        viewModelScope.launch {
-            runCatching { api.updateUser(id, name, role, disabled, password) }
-                .onSuccess { loadUsers(); _state.update { it.showToast("账号已更新") } }
-                .onFailure { e -> _state.update { it.copy(error = e.message).showToast("更新失败") } }
-        }
-    }
-
     fun changePassword(current: String, next: String) {
         viewModelScope.launch {
             runCatching { api.changePassword(current, next) }
                 .onSuccess { response -> _state.update { it.copy(user = response.user).showToast("密码已修改") } }
-                .onFailure { e -> _state.update { it.copy(error = e.message).showToast("密码修改失败") } }
+                .onFailure { e -> _state.update { it.showToast(friendlyError(e, "密码修改失败") ?: "密码修改失败") } }
+        }
+    }
+
+    fun regenerateRecoveryCode(currentPassword: String) {
+        viewModelScope.launch {
+            runCatching { api.regenerateRecoveryCode(currentPassword) }
+                .onSuccess { code -> _state.update { it.copy(recoveryCode = code) } }
+                .onFailure { e -> _state.update { it.showToast(friendlyError(e, "获取恢复码失败") ?: "获取恢复码失败") } }
+        }
+    }
+
+    fun ackRecoveryCode() = _state.update { it.copy(recoveryCode = null) }
+
+    /** Family membership panel data: current family (if any) + pending invites addressed to me. */
+    fun loadFamilyPanel() {
+        viewModelScope.launch {
+            val user = _state.value.user ?: return@launch
+            val info = if (user.familyId != null) runCatching { api.fetchFamily() }.getOrNull() else null
+            val invites = if (user.accountType == "personal") {
+                runCatching { api.myInvites() }.getOrNull().orEmpty()
+            } else {
+                emptyList()
+            }
+            _state.update { it.copy(familyInfo = info, myInvites = invites) }
+        }
+    }
+
+    /** Mirrors Web's FamilyPanel act(): single busy gate, apply the inline user (when the
+     *  response carries one), refresh the panel, toast. */
+    private fun runFamilyAction(key: String, okToast: String, block: suspend () -> AuthUser?) {
+        if (_state.value.familyBusyKey != null) return
+        viewModelScope.launch {
+            _state.update { it.copy(familyBusyKey = key) }
+            runCatching { block() }
+                .onSuccess { user ->
+                    _state.update { s -> (if (user != null) s.copy(user = user) else s).showToast(okToast) }
+                    loadFamilyPanel()
+                    loadPeople()
+                }
+                .onFailure { e -> _state.update { it.showToast(friendlyError(e, "操作失败") ?: "操作失败") } }
+            _state.update { it.copy(familyBusyKey = null) }
+        }
+    }
+
+    fun createFamily(name: String?) = runFamilyAction("create", "家庭已创建") { api.createFamily(name).user }
+    fun sendFamilyInvite(username: String) = runFamilyAction("invite", "邀请已发送") { api.sendFamilyInvite(username); null }
+    fun revokeFamilyInvite(id: String) = runFamilyAction("revoke:$id", "已撤回") { api.revokeFamilyInvite(id); null }
+    fun acceptInvite(id: String) = runFamilyAction("accept:$id", "已加入家庭") { api.acceptInvite(id).user }
+    fun declineInvite(id: String) = runFamilyAction("decline:$id", "已拒绝") { api.declineInvite(id); null }
+    fun leaveFamily() = runFamilyAction("leave", "已退出家庭") { api.leaveFamily().user }
+    fun removeFamilyMember(id: String) = runFamilyAction("remove:$id", "已移出家庭") { api.removeFamilyMember(id); null }
+
+    fun loadGraph() {
+        viewModelScope.launch {
+            _state.update { it.copy(graphLoading = true) }
+            runCatching { api.graph() }
+                .onSuccess { res -> _state.update { it.copy(graphNodes = res.nodes, graphEdges = res.edges, graphLoading = false) } }
+                .onFailure { e -> _state.update { it.copy(graphLoading = false, error = e.message) } }
+        }
+    }
+
+    fun deleteGraphEdge(id: String) {
+        viewModelScope.launch {
+            runCatching { api.deleteRelationship(id) }
+                .onSuccess { _state.update { it.copy(graphEdges = it.graphEdges.filterNot { e -> e.id == id }) } }
+                .onFailure { _state.update { it.showToast("没删掉,稍后再试") } }
         }
     }
 
@@ -821,6 +1249,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         const val THUMBNAIL_CONCURRENCY = 6
         const val THUMBNAIL_BATCH = 12
         const val THUMBNAIL_CACHE_BYTES = 32 * 1024 * 1024
+        const val CHANGE_DEBOUNCE_MS = 1_000L
+        const val CHANGE_MAX_WAIT_MS = 3_000L
+        const val CHANGE_FEED_BACKOFF_MIN_MS = 1_000L
+        const val CHANGE_FEED_BACKOFF_MAX_MS = 30_000L
 
         fun formatChineseDate(timestamp: Long): String =
             SimpleDateFormat("yyyy年M月d日", Locale.CHINA).format(Date(timestamp))

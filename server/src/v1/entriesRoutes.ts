@@ -105,8 +105,21 @@ entriesRoutes.post('/entries', bodyLimit({
   if (!isJpeg(imageBuf) || !isJpeg(thumbBuf))
     return err(c, 'VALIDATION', 'invalid JPEG data');
   const udk = udkOf(c);
-  const created = await store.putEntry(meta, imageBuf, thumbBuf, udk);
-  if (!created) return err(c, 'CONFLICT', 'entry id already exists');
+  const override = form.get('override') === '1' || form.get('override') === 'true';
+  const result = await store.createEntryIdempotent(meta, imageBuf, thumbBuf, udk, override);
+  if (result.kind === 'replay') {
+    const existing = await store.getEntryDecrypted(result.id, udk);
+    return c.json(existing, 200);
+  }
+  if (result.kind === 'duplicate')
+    return c.json(
+      {
+        error: { code: 'DUPLICATE_IMAGE', message: 'same image already exists for this account' },
+        duplicateOf: { id: result.id, takenAt: result.takenAt },
+      },
+      409,
+    );
+  if (result.kind === 'id_conflict') return err(c, 'CONFLICT', 'entry id already exists');
 
   if (process.env.INFERENCE_DISABLED !== '1') {
     void enqueueInference(

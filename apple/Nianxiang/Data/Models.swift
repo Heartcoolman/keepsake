@@ -37,11 +37,16 @@ struct AuthUser: Codable, Identifiable, Equatable {
     var username: String
     var displayName: String
     var role = "member"
+    var accountType: String?
+    var familyId: String?
+    var plan: String?
     var disabled = false
     var createdAt: Int64 = 0
     var updatedAt: Int64 = 0
 
-    enum CodingKeys: String, CodingKey { case id, username, displayName, role, disabled, createdAt, updatedAt }
+    enum CodingKeys: String, CodingKey {
+        case id, username, displayName, role, accountType, familyId, plan, disabled, createdAt, updatedAt
+    }
 
     init(id: String, username: String, displayName: String, role: String = "member", disabled: Bool = false) {
         self.id = id
@@ -57,6 +62,9 @@ struct AuthUser: Codable, Identifiable, Equatable {
         username = c.value(.username, default: "")
         displayName = c.value(.displayName, default: "")
         role = c.value(.role, default: "member")
+        accountType = try? c.decodeIfPresent(String.self, forKey: .accountType)
+        familyId = try? c.decodeIfPresent(String.self, forKey: .familyId)
+        plan = try? c.decodeIfPresent(String.self, forKey: .plan)
         disabled = c.value(.disabled, default: false)
         createdAt = c.value(.createdAt, default: 0)
         updatedAt = c.value(.updatedAt, default: 0)
@@ -68,8 +76,11 @@ struct AuthResponse: Decodable {
     var refreshToken: String
     var expiresIn = 3600
     var user: AuthUser
+    /// One-shot: present on register/bootstrap/recover, and on login/unlock when the
+    /// account had no at-rest crypto yet (legacy upgrade path).
+    var recoveryCode: String?
 
-    enum CodingKeys: String, CodingKey { case accessToken, refreshToken, expiresIn, user }
+    enum CodingKeys: String, CodingKey { case accessToken, refreshToken, expiresIn, user, recoveryCode }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -77,6 +88,7 @@ struct AuthResponse: Decodable {
         refreshToken = try c.decode(String.self, forKey: .refreshToken)
         expiresIn = c.value(.expiresIn, default: 3600)
         user = try c.decode(AuthUser.self, forKey: .user)
+        recoveryCode = try? c.decodeIfPresent(String.self, forKey: .recoveryCode)
     }
 }
 
@@ -123,10 +135,11 @@ struct Entry: Codable, Identifiable, Equatable {
     var people: [PersonRef] = []
     var unknownFaces = 0
     var faceScannedAt: Int64 = 0
+    var clientUploadId = ""
 
     enum CodingKeys: String, CodingKey {
         case id, createdAt, takenAt, uploadedAt, dateSource, yearMonth, status, title, mood
-        case diaryText, imageDescription, chat, ownerId, userId, people, unknownFaces, faceScannedAt
+        case diaryText, imageDescription, chat, ownerId, userId, people, unknownFaces, faceScannedAt, clientUploadId
     }
 
     init(id: String) { self.id = id }
@@ -150,6 +163,7 @@ struct Entry: Codable, Identifiable, Equatable {
         people = c.value(.people, default: [])
         unknownFaces = c.value(.unknownFaces, default: 0)
         faceScannedAt = c.value(.faceScannedAt, default: 0)
+        clientUploadId = c.value(.clientUploadId, default: "")
     }
 }
 
@@ -163,6 +177,25 @@ struct EntryPage: Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = c.value(.items, default: [])
         nextCursor = try? c.decodeIfPresent(String.self, forKey: .nextCursor)
+    }
+}
+
+/// One frame from GET /api/v1/entries/changes. type: cursor|change|resync|ping.
+/// seq/entryId/kind are only meaningful for the frame types that carry them.
+struct ChangeFrame: Decodable {
+    var type = ""
+    var seq: Int64 = 0
+    var entryId = ""
+    var kind = ""
+
+    enum CodingKeys: String, CodingKey { case type, seq, entryId, kind }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = c.value(.type, default: "")
+        seq = c.value(.seq, default: 0)
+        entryId = c.value(.entryId, default: "")
+        kind = c.value(.kind, default: "")
     }
 }
 
@@ -382,12 +415,249 @@ struct ErrorDetail: Decodable {
     }
 }
 
-struct ErrorBody: Decodable {
-    var error: ErrorDetail?
+struct DuplicateOfDetail: Decodable {
+    var id = ""
+    var takenAt: Int64 = 0
+
+    enum CodingKeys: String, CodingKey { case id, takenAt }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = c.value(.id, default: "")
+        takenAt = c.value(.takenAt, default: 0)
+    }
 }
 
-struct MeResponse: Decodable { var user: AuthUser }
-struct UserResponse: Decodable { var user: AuthUser }
+struct ErrorBody: Decodable {
+    var error: ErrorDetail?
+    var duplicateOf: DuplicateOfDetail?
+}
+
+struct MeResponse: Decodable {
+    var user: AuthUser
+    var family: FamilySummary?
+    var migrationPending = false
+    var locked = false
+
+    enum CodingKeys: String, CodingKey { case user, family, migrationPending, locked }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        user = try c.decode(AuthUser.self, forKey: .user)
+        family = try? c.decodeIfPresent(FamilySummary.self, forKey: .family)
+        migrationPending = c.value(.migrationPending, default: false)
+        locked = c.value(.locked, default: false)
+    }
+}
+
+// MARK: - Family / recovery
+
+struct FamilySummary: Decodable, Equatable {
+    var id: String
+    var name: String
+    var ownerId: String
+
+    enum CodingKeys: String, CodingKey { case id, name, ownerId }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = c.value(.name, default: "")
+        ownerId = c.value(.ownerId, default: "")
+    }
+}
+
+struct UnlockResponse: Decodable {
+    var ok = false
+    var recoveryCode: String?
+
+    enum CodingKeys: String, CodingKey { case ok, recoveryCode }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = c.value(.ok, default: false)
+        recoveryCode = try? c.decodeIfPresent(String.self, forKey: .recoveryCode)
+    }
+}
+
+struct RecoveryCodeResponse: Decodable {
+    var recoveryCode: String
+
+    enum CodingKeys: String, CodingKey { case recoveryCode }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        recoveryCode = c.value(.recoveryCode, default: "")
+    }
+}
+
+/// Owner-side view of a pending invite (on GET /family).
+struct FamilyInvite: Decodable, Identifiable, Equatable {
+    var id: String
+    var inviteeId: String
+    var inviteeName: String
+    var createdAt: Int64 = 0
+
+    enum CodingKeys: String, CodingKey { case id, inviteeId, inviteeName, createdAt }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        inviteeId = c.value(.inviteeId, default: "")
+        inviteeName = c.value(.inviteeName, default: "")
+        createdAt = c.value(.createdAt, default: 0)
+    }
+}
+
+struct FamilyInfo: Decodable {
+    var family: FamilySummary?
+    var members: [AuthUser] = []
+    var invites: [FamilyInvite] = []
+
+    enum CodingKeys: String, CodingKey { case family, members, invites }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        family = try? c.decodeIfPresent(FamilySummary.self, forKey: .family)
+        members = c.value(.members, default: [])
+        invites = c.value(.invites, default: [])
+    }
+}
+
+/// Invitee-side view of a pending invite (on GET /me/invites).
+struct MyInvite: Decodable, Identifiable, Equatable {
+    var id: String
+    var familyId: String
+    var familyName: String
+    var inviterName: String
+    var createdAt: Int64 = 0
+
+    enum CodingKeys: String, CodingKey { case id, familyId, familyName, inviterName, createdAt }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        familyId = c.value(.familyId, default: "")
+        familyName = c.value(.familyName, default: "")
+        inviterName = c.value(.inviterName, default: "")
+        createdAt = c.value(.createdAt, default: 0)
+    }
+}
+
+struct MyInvitePage: Decodable {
+    var items: [MyInvite] = []
+
+    enum CodingKeys: String, CodingKey { case items }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        items = c.value(.items, default: [])
+    }
+}
+
+/// createFamily/acceptInvite/leaveFamily inline the caller's freshest AuthUser so the
+/// view model can apply it directly instead of round-tripping through GET /auth/me.
+struct FamilyActionResponse: Decodable {
+    var ok = false
+    var family: FamilySummary?
+    var user: AuthUser?
+
+    enum CodingKeys: String, CodingKey { case ok, family, user }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = c.value(.ok, default: false)
+        family = try? c.decodeIfPresent(FamilySummary.self, forKey: .family)
+        user = try? c.decodeIfPresent(AuthUser.self, forKey: .user)
+    }
+}
+
+// MARK: - Relationship graph
+
+struct GraphNode: Decodable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var relation = ""
+    var isUser = false
+    var createdAt: Int64 = 0
+    var updatedAt: Int64 = 0
+    var templateCount = 0
+    var enrolledFrom: [FaceRef] = []
+    var degree = 0
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, relation, isUser, createdAt, updatedAt, templateCount, enrolledFrom, degree
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = c.value(.name, default: "")
+        relation = c.value(.relation, default: "")
+        isUser = c.value(.isUser, default: false)
+        createdAt = c.value(.createdAt, default: 0)
+        updatedAt = c.value(.updatedAt, default: 0)
+        templateCount = c.value(.templateCount, default: 0)
+        enrolledFrom = c.value(.enrolledFrom, default: [])
+        degree = c.value(.degree, default: 0)
+    }
+}
+
+struct RelationEvidence: Decodable, Equatable {
+    var entryId = ""
+    var kind = ""
+    var createdAt: Int64 = 0
+
+    enum CodingKeys: String, CodingKey { case entryId, kind, createdAt }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        entryId = c.value(.entryId, default: "")
+        kind = c.value(.kind, default: "")
+        createdAt = c.value(.createdAt, default: 0)
+    }
+}
+
+struct RelationshipDto: Decodable, Identifiable, Equatable {
+    var id: String
+    var a: String
+    var b: String
+    var label = ""
+    var confidence: Double = 0
+    var evidence: [RelationEvidence] = []
+    var createdAt: Int64 = 0
+    var updatedAt: Int64 = 0
+    /// Synthesized from Person.relation at query time — not persisted, not deletable.
+    var virtual = false
+
+    enum CodingKeys: String, CodingKey { case id, a, b, label, confidence, evidence, createdAt, updatedAt, virtual }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        a = c.value(.a, default: "")
+        b = c.value(.b, default: "")
+        label = c.value(.label, default: "")
+        confidence = c.value(.confidence, default: 0)
+        evidence = c.value(.evidence, default: [])
+        createdAt = c.value(.createdAt, default: 0)
+        updatedAt = c.value(.updatedAt, default: 0)
+        virtual = c.value(.virtual, default: false)
+    }
+}
+
+struct GraphResponse: Decodable {
+    var nodes: [GraphNode] = []
+    var edges: [RelationshipDto] = []
+
+    enum CodingKeys: String, CodingKey { case nodes, edges }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        nodes = c.value(.nodes, default: [])
+        edges = c.value(.edges, default: [])
+    }
+}
 
 struct UserPage: Decodable {
     var items: [AuthUser] = []
@@ -404,6 +674,16 @@ struct ApiError: Error, LocalizedError {
     let status: Int
     let code: String
     let message: String
+    let duplicateOfId: String?
+    let duplicateOfTakenAt: Int64?
+
+    init(status: Int, code: String, message: String, duplicateOfId: String? = nil, duplicateOfTakenAt: Int64? = nil) {
+        self.status = status
+        self.code = code
+        self.message = message
+        self.duplicateOfId = duplicateOfId
+        self.duplicateOfTakenAt = duplicateOfTakenAt
+    }
 
     var errorDescription: String? { message }
 }

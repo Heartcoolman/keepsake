@@ -11,6 +11,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { fileURLToPath } from 'node:url';
 import { createKeyedQueue } from './lib/keyedQueue.ts';
 import { writeAtomic } from './lib/atomicFile.ts';
+import * as changeFeed from './changeFeed.ts';
 import {
   decryptBuffer,
   decryptJson,
@@ -60,6 +61,9 @@ export interface EntryMeta {
   familyId: string | null;
   /** sha256 of the plaintext image — cache key for face/depth without decrypting. */
   imageHash: string;
+  /** Client-generated upload id — idempotency key for retried uploads. '' on legacy rows.
+   *  Immutable after creation; never patchable. */
+  clientUploadId: string;
   people: PersonRef[];
   unknownFaces: number;
   faceScannedAt: number;
@@ -88,6 +92,7 @@ export interface ListEntriesResult {
 const DIR = fileURLToPath(new URL('../data/entries/', import.meta.url));
 // ids go into file paths — reject anything that could traverse
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+const CLIENT_UPLOAD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const DATE_SOURCES = new Set<DateSource>([
   'exif',
   'filename',
@@ -111,6 +116,9 @@ let indexLoad: Promise<Map<string, StoredEntry>> | null = null;
 
 const entryQueue = createKeyedQueue();
 const monthlyQueue = createKeyedQueue();
+// serializes one owner's uploads so clientUploadId / same-image checks can't race
+// across different entry ids; separate instance from entryQueue, so no deadlock
+const uploadQueueByOwner = createKeyedQueue();
 
 export const validId = (id: string): boolean => ID_RE.test(id);
 
@@ -172,6 +180,9 @@ export function sanitizeMeta(raw: Record<string, unknown>): EntryMeta {
     familyId:
       typeof raw.familyId === 'string' && ID_RE.test(raw.familyId) ? raw.familyId : null,
     imageHash: /^[a-f0-9]{64}$/.test(str(raw.imageHash)) ? str(raw.imageHash) : '',
+    clientUploadId: CLIENT_UPLOAD_ID_RE.test(str(raw.clientUploadId))
+      ? str(raw.clientUploadId)
+      : '',
     people: Array.isArray(raw.people)
       ? raw.people.slice(0, 20).map((p: { personId?: unknown; faceIndex?: unknown }) => ({
           personId: str(p?.personId),
@@ -522,7 +533,52 @@ export async function putEntry(
       { path: DIR + id + '.json', data: metaJson },
     ]);
     map.set(id, parseStored(JSON.parse(metaJson) as Record<string, unknown>));
+    changeFeed.publish(full.ownerId || full.userId, id, 'created');
     return true;
+  });
+}
+
+export type CreateEntryResult =
+  | { kind: 'created' }
+  | { kind: 'replay'; id: string }
+  | { kind: 'duplicate'; id: string; takenAt: number }
+  | { kind: 'id_conflict' };
+
+/**
+ * putEntry with upload idempotency: a replayed clientUploadId returns the entry it
+ * already created (regardless of `override`), and a same-owner same-image upload is
+ * rejected with a duplicate hint unless `override` is set. Runs under a per-owner
+ * lock — deliberately serializes ALL of one owner's uploads (correctness over
+ * throughput at personal scale; the O(n) scans below rely on it).
+ */
+export async function createEntryIdempotent(
+  meta: EntryMeta,
+  image: Buffer,
+  thumb: Buffer,
+  udk: Buffer,
+  override: boolean,
+): Promise<CreateEntryResult> {
+  const ownerId = meta.ownerId || meta.userId;
+  return uploadQueueByOwner(ownerId, async () => {
+    const rows = [...(await load()).values()].filter(
+      (s) => s.meta.ownerId === ownerId || s.meta.userId === ownerId,
+    );
+    if (meta.clientUploadId) {
+      const replayed = rows.find((s) => s.meta.clientUploadId === meta.clientUploadId);
+      if (replayed) return { kind: 'replay', id: replayed.meta.id };
+    }
+    if (!override) {
+      const hash = hashImage(image);
+      const dup = rows.find((s) => s.meta.imageHash === hash);
+      if (dup)
+        return {
+          kind: 'duplicate',
+          id: dup.meta.id,
+          takenAt: dup.meta.takenAt || dup.meta.createdAt,
+        };
+    }
+    const created = await putEntry(meta, image, thumb, udk);
+    return created ? { kind: 'created' } : { kind: 'id_conflict' };
   });
 }
 
@@ -561,6 +617,7 @@ export async function patchEntry(
       : { meta: nextMeta, enc: null };
     await writeAtomic(DIR + id + '.json', diskJson(next));
     map.set(id, next);
+    changeFeed.publish(nextMeta.ownerId || nextMeta.userId, id, 'updated');
     return next.meta;
   });
 }
@@ -592,6 +649,7 @@ export async function updateEntryContent(
     const next = toStored(nextFull, udk);
     await writeAtomic(DIR + id + '.json', diskJson(next));
     map.set(id, next);
+    changeFeed.publish(nextFull.ownerId || nextFull.userId, id, 'updated');
     return nextFull;
   });
 }
@@ -660,9 +718,11 @@ export async function rewritePersonRefs(fromId: string, targetId?: string): Prom
 export async function deleteEntry(id: string): Promise<boolean> {
   return entryQueue(id, async () => {
     const map = await load();
-    if (!map.has(id)) return false;
+    const cur = map.get(id);
+    if (!cur) return false;
     await removeFilesAtomically(['.json', '.img', '.thumb'].map((ext) => DIR + id + ext));
     map.delete(id);
+    changeFeed.publish(cur.meta.ownerId || cur.meta.userId, id, 'deleted');
     return true;
   });
 }

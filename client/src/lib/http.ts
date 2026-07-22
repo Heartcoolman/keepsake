@@ -127,12 +127,15 @@ export function isAuthSession(v: unknown): v is AuthSession {
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  /** Present on 409 DUPLICATE_IMAGE: the existing entry the upload collided with. */
+  readonly duplicateOf?: { id: string; takenAt: number };
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, duplicateOf?: { id: string; takenAt: number }) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.duplicateOf = duplicateOf;
   }
 }
 
@@ -140,14 +143,19 @@ export class ApiError extends Error {
 export async function errorFromResponse(res: Response, label: string): Promise<ApiError> {
   let detail = '';
   let code: string | undefined;
+  let duplicateOf: { id: string; takenAt: number } | undefined;
   try {
-    const body = (await res.clone().json()) as { error?: { message?: string; code?: string } };
+    const body = (await res.clone().json()) as {
+      error?: { message?: string; code?: string };
+      duplicateOf?: { id: string; takenAt: number };
+    };
     if (body.error?.message) detail = body.error.message;
     if (body.error?.code) code = body.error.code;
+    if (body.duplicateOf) duplicateOf = body.duplicateOf;
   } catch {
     // non-JSON error body
   }
-  return new ApiError(`${label}: ${res.status}${detail ? ` ${detail}` : ''}`, res.status, code);
+  return new ApiError(`${label}: ${res.status}${detail ? ` ${detail}` : ''}`, res.status, code, duplicateOf);
 }
 
 const ERROR_MESSAGES: Record<string, string> = {

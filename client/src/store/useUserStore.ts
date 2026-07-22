@@ -25,6 +25,7 @@ import {
 } from '../lib/http';
 import { revokeAllMedia } from '../lib/media';
 import { migrateLegacyData, refreshEntries, setEntriesViewUser } from '../lib/db';
+import { startChangeFeed, stopChangeFeed } from '../lib/changeFeed';
 
 export type AuthMode = 'loading' | 'bootstrap' | 'login' | 'locked' | 'ready';
 
@@ -60,6 +61,7 @@ interface UserState {
  *  view, and any open per-user overlay/state. Used by both logout and refresh-loss. */
 function clearUserScopedState(): void {
   clearSession();
+  stopChangeFeed();
   revokeAllMedia();
   setEntriesViewUser(undefined);
   void import('./usePeopleStore').then(({ usePeopleStore }) =>
@@ -90,6 +92,7 @@ function readyState(user: AuthUser): Pick<
 
 function onAuthed(user: AuthUser): void {
   setEntriesViewUser(user.id);
+  startChangeFeed(user.id);
   void (async () => {
     try {
       const moved = await migrateLegacyData(user.id);

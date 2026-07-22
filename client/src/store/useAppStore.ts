@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { addEntry, deleteEntry, getEntry, getEntryImage, refreshEntries, updateEntry } from '../lib/db';
+import { ApiError } from '../lib/http';
 import {
   sessionOpen,
   sessionMessage,
@@ -55,8 +56,12 @@ interface AppState {
   busy: boolean;
   toast: string | null;
   toastKind: 'info' | 'error';
+  /** Set while addPhotos is paused on a DUPLICATE_IMAGE response, waiting for the user's choice. */
+  pendingDuplicate: { fileName: string; duplicateOf?: { id: string; takenAt: number } } | null;
 
   addPhotos: (files: FileList | File[]) => Promise<void>;
+  /** Resolve the pending duplicate-photo prompt: true = create anyway, false = skip this file. */
+  resolveDuplicate: (createAnyway: boolean) => void;
   openEntry: (id: string, fromRect?: DOMRect | null) => Promise<void>;
   removeEntry: (id: string) => Promise<void>;
   sendUserMessage: (text: string) => Promise<void>;
@@ -75,6 +80,13 @@ interface AppState {
 }
 
 const EMPTY_DIARY: Diary = { title: '', mood: '', body: '' };
+function randomId(): string {
+  // crypto.randomUUID is secure-context-only; keep working on plain-http LAN deploys
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
+  );
+}
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
@@ -110,6 +122,17 @@ export const useAppStore = create<AppState>((set, get) => {
   const activeOperations = new Set<AbortController>();
   let imageLoadTail: Promise<void> = Promise.resolve();
   let toastToken = 0;
+  let duplicateResolver: ((createAnyway: boolean) => void) | null = null;
+
+  /** Pause addPhotos on a DUPLICATE_IMAGE response and await the user's skip/create-anyway choice. */
+  const confirmDuplicate = (
+    fileName: string,
+    duplicateOf?: { id: string; takenAt: number },
+  ): Promise<boolean> =>
+    new Promise((resolve) => {
+      duplicateResolver = resolve;
+      set({ pendingDuplicate: { fileName, duplicateOf } });
+    });
 
   const invalidateSession = (): void => {
     sessionGeneration++;
@@ -225,6 +248,7 @@ export const useAppStore = create<AppState>((set, get) => {
     busy: false,
     toast: null,
     toastKind: 'info',
+    pendingDuplicate: null,
 
     async addPhotos(files) {
       const list = Array.from(files).filter((f) => f.type.startsWith('image/'));
@@ -239,6 +263,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       const ids: string[] = [];
       let missingDate = 0;
+      let skippedDuplicates = 0;
       for (const file of list) {
         try {
           // read EXIF before canvas downscale strips metadata
@@ -248,10 +273,7 @@ export const useAppStore = create<AppState>((set, get) => {
           const thumb = await makeThumb(working);
           const uploadedAt = Date.now();
           const entry: Entry = {
-            // crypto.randomUUID is secure-context-only; keep working on plain-http LAN deploys
-            id:
-              globalThis.crypto?.randomUUID?.() ??
-              `${uploadedAt.toString(36)}-${Math.random().toString(36).slice(2, 12)}`,
+            id: randomId(),
             createdAt: takenAt,
             takenAt,
             uploadedAt,
@@ -269,7 +291,30 @@ export const useAppStore = create<AppState>((set, get) => {
             faceScannedAt: 0,
             relationScannedAt: 0,
           };
-          await addEntry(entry, working, thumb, { refresh: false });
+          const clientUploadId = randomId();
+          let override = false;
+          let skipped = false;
+          for (;;) {
+            try {
+              await addEntry(entry, working, thumb, { refresh: false, clientUploadId, override });
+              break;
+            } catch (error) {
+              if (error instanceof ApiError && error.code === 'DUPLICATE_IMAGE' && !override) {
+                const createAnyway = await confirmDuplicate(file.name, error.duplicateOf);
+                if (!createAnyway) {
+                  skipped = true;
+                  break;
+                }
+                override = true;
+                continue;
+              }
+              throw error;
+            }
+          }
+          if (skipped) {
+            skippedDuplicates++;
+            continue;
+          }
           ids.push(entry.id);
         } catch {
           get().showToast(`「${file.name}」没存上,检查格式或网络`);
@@ -282,7 +327,17 @@ export const useAppStore = create<AppState>((set, get) => {
           `有 ${missingDate} 张没读到拍摄时间,已按今天记;可在日期处修改`,
         );
       }
+      if (skippedDuplicates > 0) {
+        get().showToast(`已跳过 ${skippedDuplicates} 张重复照片${ids.length ? `,存了 ${ids.length} 张` : ''}`);
+      }
       if (ids.length === 1) void get().openEntry(ids[0]!).catch(() => undefined);
+    },
+
+    resolveDuplicate(createAnyway) {
+      const resolve = duplicateResolver;
+      duplicateResolver = null;
+      set({ pendingDuplicate: null });
+      resolve?.(createAnyway);
     },
 
     async openEntry(id, fromRect) {

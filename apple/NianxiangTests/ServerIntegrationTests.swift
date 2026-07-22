@@ -34,7 +34,7 @@ final class ServerIntegrationTests: XCTestCase {
             _ = try await api.bootstrap(username: username, password: password, displayName: "E2E")
         }
         let me = try await api.me()
-        XCTAssertEqual(me.username, username)
+        XCTAssertEqual(me.user.username, username)
 
         // 2. Upload a generated photo through the real multipart path.
         let jpeg = try Self.makeJpeg(side: 256)
@@ -48,8 +48,8 @@ final class ServerIntegrationTests: XCTestCase {
         meta.yearMonth = AppViewModel.yearMonth(from: now)
         meta.status = "new"
         meta.title = "e2e 照片"
-        meta.userId = me.id
-        meta.ownerId = me.id
+        meta.userId = me.user.id
+        meta.ownerId = me.user.id
         let created = try await api.uploadEntry(meta: meta, jpeg: jpeg, thumb: thumb)
         XCTAssertEqual(created.id, meta.id)
 

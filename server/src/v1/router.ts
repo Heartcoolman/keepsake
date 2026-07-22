@@ -3,6 +3,7 @@ import * as accounts from '../accounts.ts';
 import { authRoutes } from './authRoutes.ts';
 import { familyRoutes } from './familyRoutes.ts';
 import { entriesRoutes } from './entriesRoutes.ts';
+import { changesRoutes } from './changesRoutes.ts';
 import { peopleRoutes } from './peopleRoutes.ts';
 import { relationshipRoutes } from './relationshipRoutes.ts';
 import { profileRoutes } from './profileRoutes.ts';
@@ -59,6 +60,9 @@ export function createV1Router(): Hono<AppEnv> {
   });
 
   v1.route('/', familyRoutes);
+  // before entriesRoutes: /entries/changes must match ahead of /entries/:id
+  // and must not inherit entriesRoutes' blanket requireKeys
+  v1.route('/', changesRoutes);
   v1.route('/', entriesRoutes);
   v1.route('/', peopleRoutes);
   v1.route('/', relationshipRoutes);

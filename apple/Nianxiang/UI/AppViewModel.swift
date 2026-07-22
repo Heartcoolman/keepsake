@@ -8,6 +8,7 @@ import Observation
 final class AppViewModel {
     let api: ApiClient
     let session: SessionStore
+    let uploadQueue: UploadQueue
 
     // Connection & auth
     var baseUrl: String
@@ -31,7 +32,18 @@ final class AppViewModel {
     var monthlyReview: MonthlyReview?
     var monthlyStream = ""
     var selectedMonth = ""
-    var adminUsers: [AuthUser] = []
+
+    // Account / family / recovery
+    var locked = false
+    var recoveryCode: String?
+    var familyInfo: FamilyInfo?
+    var myInvites: [MyInvite] = []
+    var familyBusyKey: String?
+
+    // Relationship graph
+    var graphNodes: [GraphNode] = []
+    var graphEdges: [RelationshipDto] = []
+    var graphLoading = false
 
     // Session
     var sessionEntry: Entry?
@@ -44,18 +56,64 @@ final class AppViewModel {
     var toast: String?
     var photoBytes: Data?
     var depthJson: String?
+    var depthVersion = 0
     var navigateToSession = false
+    var duplicatePrompt: DuplicatePrompt?
+    var pendingDecisionCount = 0
 
     @ObservationIgnored private var sessionStreamTask: Task<Void, Never>?
     @ObservationIgnored private var sessionLoadTask: Task<Void, Never>?
     @ObservationIgnored private var thumbnailBytesTotal = 0
+    @ObservationIgnored private var duplicateDecision: CheckedContinuation<Bool, Never>?
+    @ObservationIgnored private var isDraining = false
+    @ObservationIgnored private var isForeground = true
+    @ObservationIgnored private let connectivity = ConnectivityObserver()
+    @ObservationIgnored private var changeFeedTask: Task<Void, Never>?
+    @ObservationIgnored private var changeFeedSeq: Int64 = 0
+    @ObservationIgnored private var coalesceTask: Task<Void, Never>?
+    @ObservationIgnored private var coalesceDeadline: ContinuousClock.Instant?
+
+    struct DuplicatePrompt: Equatable {
+        let entryId: String
+        let takenAt: Int64
+    }
 
     init(container: AppContainer = AppContainer.shared) {
         api = container.api
         session = container.session
+        uploadQueue = container.uploadQueue
         baseUrl = session.getBaseUrl()
         user = session.getUser()
+        refreshPendingDecisionCount()
+        connectivity.onRegained = { [weak self] in
+            guard let self, self.isForeground else { return }
+            self.drainQueue(interactive: false)
+            self.restartChangeFeed()
+        }
+        connectivity.start()
+        api.onKeysLocked = { [weak self] in
+            Task { @MainActor [weak self] in
+                // Only a ready session flips to locked — a mid-login/register lock is surfaced
+                // as a normal error by that action instead (mirrors Web's mode === 'ready' gate).
+                guard let self, self.user != nil else { return }
+                self.locked = true
+            }
+        }
         Task { await start() }
+    }
+
+    /// Foreground transitions drain the queue and (re)start the change feed; backgrounding stops
+    /// the feed (see also connectivity.onRegained above, which also kicks a feed reconnect).
+    func handleScenePhaseChange(active: Bool) {
+        isForeground = active
+        if active {
+            drainQueue(interactive: false)
+            // Entries/people require unlocked keys; the change feed doesn't, so it can still start.
+            if user != nil, !locked { loadHome(clearError: false) } // cheap catch-up refresh after backgrounding
+            startChangeFeed()
+        } else {
+            stopChangeFeed()
+        }
     }
 
     private func cancelSessionTasks() {
@@ -68,10 +126,18 @@ final class AppViewModel {
     private func start() async {
         await refreshHealth()
         guard session.getAccess() != nil else { return }
+        drainQueue(interactive: false)
         do {
             let me = try await api.me()
-            user = me
-            loadHome()
+            user = me.user
+            if me.locked {
+                // Valid session, server keyring empty (restart): unlock instead of re-login.
+                // Don't touch entries/change-feed yet — unlock(password:) starts them.
+                locked = true
+            } else {
+                loadHome()
+                startChangeFeed()
+            }
         } catch let apiError as ApiError where apiError.status == 401 || apiError.status == 403 {
             // 服务器明确拒绝鉴权才登出；连不上时保留本地会话离线进入。
             session.clearSession()
@@ -80,6 +146,7 @@ final class AppViewModel {
             if user != nil {
                 self.error = error.localizedDescription
                 loadHome()
+                startChangeFeed()
             }
         }
     }
@@ -109,30 +176,90 @@ final class AppViewModel {
     }
 
     func login(username: String, password: String) {
-        authAction { try await self.api.login(username: username, password: password).user }
+        authAction(fallback: "登录失败", overrides: ["UNAUTHORIZED": "用户名或密码不正确"]) {
+            try await self.api.login(username: username, password: password)
+        }
     }
 
     func bootstrap(username: String, password: String, displayName: String) {
-        authAction { try await self.api.bootstrap(username: username, password: password, displayName: displayName).user }
+        authAction(fallback: "初始化失败", overrides: [
+            "CONFLICT": "用户名已被占用",
+            "VALIDATION": "用户名需 3-32 位字母/数字/下划线,密码至少 8 位",
+        ]) {
+            try await self.api.bootstrap(username: username, password: password, displayName: displayName)
+        }
     }
 
-    private func authAction(_ block: @escaping () async throws -> AuthUser) {
+    func register(
+        accountType: String, username: String, password: String,
+        displayName: String, familyName: String, regCode: String
+    ) {
+        authAction(fallback: "注册失败", overrides: [
+            "CONFLICT": "用户名已被占用",
+            "VALIDATION": "用户名需 3-32 位字母/数字/下划线,密码至少 8 位",
+        ]) {
+            try await self.api.register(
+                accountType: accountType, username: username, password: password,
+                displayName: displayName.isEmpty ? nil : displayName,
+                familyName: familyName.isEmpty ? nil : familyName,
+                regCode: regCode.isEmpty ? nil : regCode
+            )
+        }
+    }
+
+    func recover(username: String, recoveryCode: String, newPassword: String) {
+        authAction(fallback: "找回失败", overrides: [
+            "UNAUTHORIZED": "恢复码不正确",
+            "NOT_FOUND": "用户名不存在",
+        ]) {
+            try await self.api.recover(username: username, recoveryCode: recoveryCode, newPassword: newPassword)
+        }
+    }
+
+    /// Shared by login/bootstrap/register/recover: install the session, surface the one-shot
+    /// recovery code, go ready. Mirrors Web useUserStore's enterSession().
+    private func authAction(fallback: String, overrides: [String: String] = [:], _ block: @escaping () async throws -> AuthResponse) {
         Task {
             loading = true
             error = nil
             do {
-                user = try await block()
+                let response = try await block()
+                user = response.user
+                recoveryCode = response.recoveryCode
                 loading = false
                 loadHome()
+                startChangeFeed()
             } catch {
                 loading = false
-                self.error = error.localizedDescription
+                // A locked keyring mid-login is not an expected state; never leave error empty here.
+                self.error = friendlyError(error, fallback: fallback, overrides: overrides) ?? fallback
+            }
+        }
+    }
+
+    /// Server restarted, keyring empty: re-enter the password. Same session — never a logout.
+    func unlock(password: String) {
+        Task {
+            loading = true
+            error = nil
+            do {
+                let response = try await api.unlock(password: password)
+                locked = false
+                recoveryCode = response.recoveryCode
+                loading = false
+                loadHome(clearError: false)
+                drainQueue(interactive: false)
+                startChangeFeed()
+            } catch {
+                loading = false
+                self.error = friendlyError(error, fallback: "解锁失败", overrides: ["UNAUTHORIZED": "密码不正确"]) ?? "解锁失败"
             }
         }
     }
 
     func logout() {
         cancelSessionTasks()
+        stopChangeFeed()
         Task {
             await api.logout()
             let keptBaseUrl = baseUrl
@@ -157,10 +284,99 @@ final class AppViewModel {
         monthlyReview = nil
         monthlyStream = ""
         selectedMonth = ""
-        adminUsers = []
+        pendingDecisionCount = 0
+        changeFeedSeq = 0
+        locked = false
+        recoveryCode = nil
+        familyInfo = nil
+        myInvites = []
+        familyBusyKey = nil
+        graphNodes = []
+        graphEdges = []
+        graphLoading = false
         closeSession()
         error = nil
         loading = false
+    }
+
+    // MARK: - Change feed
+
+    private enum ChangeFeedTiming {
+        static let debounce: Duration = .seconds(1)
+        static let maxCoalesce: Duration = .seconds(3)
+        static let initialBackoff: Duration = .seconds(1)
+        static let maxBackoff: Duration = .seconds(30)
+    }
+
+    /// Subscribes to GET /entries/changes while logged in and foreground; reconnects with
+    /// exponential backoff on error, immediately on a clean server-side close. Single-flight.
+    private func startChangeFeed() {
+        guard isForeground, user != nil, changeFeedTask == nil else { return }
+        changeFeedTask = Task {
+            var backoff = ChangeFeedTiming.initialBackoff
+            while !Task.isCancelled {
+                do {
+                    for try await frame in api.entryChanges(since: changeFeedSeq) {
+                        guard !Task.isCancelled else { return }
+                        backoff = ChangeFeedTiming.initialBackoff // a received frame confirms the connection is live
+                        handleChangeFrame(frame)
+                    }
+                    // Stream ended without error (server's periodic clean close): reconnect immediately.
+                } catch {
+                    if Task.isCancelled { return }
+                    try? await Task.sleep(for: backoff)
+                    backoff = min(backoff * 2, ChangeFeedTiming.maxBackoff)
+                }
+            }
+        }
+    }
+
+    private func stopChangeFeed() {
+        changeFeedTask?.cancel()
+        changeFeedTask = nil
+        coalesceTask?.cancel()
+        coalesceTask = nil
+        coalesceDeadline = nil
+    }
+
+    private func restartChangeFeed() {
+        stopChangeFeed()
+        startChangeFeed()
+    }
+
+    private func handleChangeFrame(_ frame: ChangeFrame) {
+        switch frame.type {
+        case "cursor":
+            changeFeedSeq = frame.seq
+        case "change":
+            changeFeedSeq = frame.seq
+            scheduleChangeRefresh()
+        case "resync":
+            changeFeedSeq = frame.seq
+            coalesceTask?.cancel()
+            coalesceTask = nil
+            coalesceDeadline = nil
+            loadHome(clearError: false)
+        default:
+            break // ping / unknown: no-op
+        }
+    }
+
+    /// Coalesces a burst of "change" frames into one refresh: each frame resets a short debounce
+    /// window, bounded by an absolute max wait since the first frame of the burst.
+    private func scheduleChangeRefresh() {
+        let clock = ContinuousClock()
+        let now = clock.now
+        let deadline = coalesceDeadline ?? now.advanced(by: ChangeFeedTiming.maxCoalesce)
+        coalesceDeadline = deadline
+        let fireAt = min(now.advanced(by: ChangeFeedTiming.debounce), deadline)
+        coalesceTask?.cancel()
+        coalesceTask = Task {
+            try? await clock.sleep(until: fireAt)
+            guard !Task.isCancelled else { return }
+            coalesceDeadline = nil
+            loadHome(clearError: false)
+        }
     }
 
     // MARK: - Timeline
@@ -308,7 +524,10 @@ final class AppViewModel {
     private func loadDepth(entryId: String) {
         Task {
             guard let depth = try? await api.depthJson(entryId: entryId), !depth.isEmpty else { return }
-            if sessionEntry?.id == entryId { depthJson = depth }
+            if sessionEntry?.id == entryId {
+                depthJson = depth
+                depthVersion += 1
+            }
         }
     }
 
@@ -505,16 +724,14 @@ final class AppViewModel {
         let fileModifiedAt: Int64
     }
 
+    /// Prepares and enqueues every photo to the on-disk queue BEFORE any network attempt (so a
+    /// process kill never loses them), then drains interactively.
     func importPhotos(_ photos: [PickedPhoto]) {
         guard !photos.isEmpty else { return }
         Task {
             loading = true
             error = nil
-            uploadProgress = "0/\(photos.count)"
-            var last: Entry?
-            var failures = 0
-            var firstFailure: String?
-            for (index, photo) in photos.enumerated() {
+            for photo in photos {
                 do {
                     let prepared = try await Task.detached(priority: .utility) {
                         try PhotoImporter.prepare(
@@ -533,26 +750,208 @@ final class AppViewModel {
                     entry.title = "未命名记忆"
                     entry.userId = user?.id ?? ""
                     entry.ownerId = user?.id ?? ""
-                    last = try await api.uploadEntry(meta: entry, jpeg: prepared.jpeg, thumb: prepared.thumb)
+                    entry.clientUploadId = UUID().uuidString
+                    try uploadQueue.enqueue(entry: entry, jpeg: prepared.jpeg, thumb: prepared.thumb)
                 } catch {
-                    failures += 1
-                    if firstFailure == nil { firstFailure = error.localizedDescription }
+                    self.error = error.localizedDescription
                 }
-                uploadProgress = "\(index + 1)/\(photos.count)"
             }
             loading = false
+            drainQueue(interactive: true)
+        }
+    }
+
+    private enum DrainOutcome {
+        case success(Entry)
+        case skippedDuplicate
+        case needsDecisionQueued
+        case retryLater
+        case networkPending
+        case gaveUp(String)
+    }
+
+    /// Single-flight: drains queued `pending` items with each item's persisted clientUploadId
+    /// (retries reuse it verbatim — the server dedups replays, which is what makes retry safe).
+    /// Interactive drains pop the duplicate dialog immediately; automatic drains (launch /
+    /// foreground / reconnect) mark DUPLICATE_IMAGE items needs_decision instead so they never
+    /// interrupt the user unprompted, and stop at the first plain network failure.
+    private func drainQueue(interactive: Bool) {
+        guard !isDraining else { return }
+        let items = uploadQueue.list().filter { $0.state == .pending }
+        guard !items.isEmpty else { return }
+        isDraining = true
+        Task {
+            defer { isDraining = false; refreshPendingDecisionCount() }
+            loading = true
+            error = nil
+            uploadProgress = "0/\(items.count)"
+            var successCount = 0, skipped = 0, stillQueued = 0, failures = 0, processed = 0
+            var firstFailure: String?
+            var lastCreated: Entry?
+            itemsLoop: for item in items {
+                let outcome = await drainOne(item, interactive: interactive)
+                processed += 1
+                uploadProgress = "\(processed)/\(items.count)"
+                switch outcome {
+                case .success(let created):
+                    successCount += 1
+                    lastCreated = created
+                case .skippedDuplicate:
+                    skipped += 1
+                case .needsDecisionQueued:
+                    break
+                case .retryLater:
+                    stillQueued += 1
+                case .gaveUp(let message):
+                    failures += 1
+                    if firstFailure == nil { firstFailure = message }
+                case .networkPending:
+                    stillQueued += 1
+                    break itemsLoop
+                }
+            }
+            stillQueued += items.count - processed
+            loading = false
             uploadProgress = ""
+            guard successCount + skipped + failures + stillQueued > 0 else { return }
             error = firstFailure
-            toast = failures == 0
-                ? "已上传 \(photos.count) 张"
-                : "\(photos.count - failures) 张成功，\(failures) 张失败：\(firstFailure ?? "请重试")"
+            toast = Self.importSummary(
+                total: items.count, failures: failures, skipped: skipped,
+                firstFailure: firstFailure, stillQueued: stillQueued
+            )
+            if interactive {
+                loadHome(clearError: false)
+                if successCount > 0, let created = lastCreated {
+                    sessionEntry = created
+                    navigateToSession = true
+                    openEntry(created)
+                }
+            } else if successCount > 0 || failures > 0 {
+                loadHome(clearError: false)
+            }
+        }
+    }
+
+    private func drainOne(_ item: QueueManifest, interactive: Bool) async -> DrainOutcome {
+        let id = item.entry.clientUploadId
+        guard let jpeg = uploadQueue.jpegData(for: id), let thumb = uploadQueue.thumbData(for: id) else {
+            uploadQueue.remove(id)
+            return .gaveUp("照片数据丢失")
+        }
+        var override = false
+        while true {
+            do {
+                let created = try await api.uploadEntry(meta: item.entry, jpeg: jpeg, thumb: thumb, override: override)
+                uploadQueue.remove(id)
+                return .success(created)
+            } catch let apiErr as ApiError where apiErr.code == "DUPLICATE_IMAGE" && !override {
+                if interactive {
+                    let confirmed = await resolveDuplicate(
+                        entryId: apiErr.duplicateOfId ?? "", takenAt: apiErr.duplicateOfTakenAt ?? 0
+                    )
+                    if confirmed { override = true; continue }
+                    uploadQueue.remove(id)
+                    return .skippedDuplicate
+                }
+                uploadQueue.markNeedsDecision(id, duplicateOfId: apiErr.duplicateOfId, duplicateOfTakenAt: apiErr.duplicateOfTakenAt)
+                return .needsDecisionQueued
+            } catch let apiErr as ApiError where apiErr.code == "E_KEYS_LOCKED" {
+                // Locked mid-drain (server restart): stay queued silently, no failed attempt, no toast.
+                return .networkPending
+            } catch let apiErr as ApiError where apiErr.status == 0 {
+                return .networkPending // no HTTP response at all — treated like a connectivity drop
+            } catch is URLError {
+                return .networkPending
+            } catch {
+                let attempts = uploadQueue.recordAttempt(id)
+                if attempts >= 5 {
+                    uploadQueue.remove(id)
+                    return .gaveUp(error.localizedDescription)
+                }
+                return .retryLater
+            }
+        }
+    }
+
+    /// Pauses the drain for a DUPLICATE_IMAGE response; resumed by confirm/skipDuplicateUpload.
+    private func resolveDuplicate(entryId: String, takenAt: Int64) async -> Bool {
+        duplicatePrompt = DuplicatePrompt(entryId: entryId, takenAt: takenAt)
+        let confirmed = await withCheckedContinuation { continuation in
+            duplicateDecision = continuation
+        }
+        duplicatePrompt = nil
+        return confirmed
+    }
+
+    func confirmDuplicateUpload() {
+        duplicateDecision?.resume(returning: true)
+        duplicateDecision = nil
+    }
+
+    func skipDuplicateUpload() {
+        duplicateDecision?.resume(returning: false)
+        duplicateDecision = nil
+    }
+
+    /// Walks queued needs_decision items (tapped from the timeline banner) through the same dialog.
+    func resolvePendingDecisions() {
+        guard !isDraining else { return }
+        let items = uploadQueue.list().filter { $0.state == .needsDecision }
+        guard !items.isEmpty else { return }
+        isDraining = true
+        Task {
+            defer { isDraining = false; refreshPendingDecisionCount() }
+            var successCount = 0
+            var skipped = 0
+            var lastCreated: Entry?
+            for item in items {
+                let id = item.entry.clientUploadId
+                guard let jpeg = uploadQueue.jpegData(for: id), let thumb = uploadQueue.thumbData(for: id) else {
+                    uploadQueue.remove(id)
+                    continue
+                }
+                let confirmed = await resolveDuplicate(
+                    entryId: item.duplicateOfId ?? "", takenAt: item.duplicateOfTakenAt ?? 0
+                )
+                if confirmed {
+                    do {
+                        let created = try await api.uploadEntry(meta: item.entry, jpeg: jpeg, thumb: thumb, override: true)
+                        uploadQueue.remove(id)
+                        lastCreated = created
+                        successCount += 1
+                    } catch {
+                        // Network hiccup on the override retry: leave needs_decision, banner stays for another tap.
+                        self.error = error.localizedDescription
+                    }
+                } else {
+                    uploadQueue.remove(id)
+                    skipped += 1
+                }
+            }
+            guard successCount + skipped > 0 else { return }
+            toast = Self.importSummary(total: successCount + skipped, failures: 0, skipped: skipped, firstFailure: nil)
             loadHome(clearError: false)
-            if let created = last {
+            if let created = lastCreated {
                 sessionEntry = created
                 navigateToSession = true
                 openEntry(created)
             }
         }
+    }
+
+    private func refreshPendingDecisionCount() {
+        pendingDecisionCount = uploadQueue.list().filter { $0.state == .needsDecision }.count
+    }
+
+    nonisolated static func importSummary(
+        total: Int, failures: Int, skipped: Int, firstFailure: String?, stillQueued: Int = 0
+    ) -> String {
+        guard failures != 0 || skipped != 0 || stillQueued != 0 else { return "已上传 \(total) 张" }
+        var parts = ["\(total - failures - skipped - stillQueued) 张成功"]
+        if skipped > 0 { parts.append("\(skipped) 张已跳过（重复）") }
+        if stillQueued > 0 { parts.append("\(stillQueued) 张待稍后重试") }
+        if failures > 0 { parts.append("\(failures) 张失败：\(firstFailure ?? "请重试")") }
+        return parts.joined(separator: "，")
     }
 
     nonisolated static func yearMonth(from millis: Int64) -> String {
@@ -701,41 +1100,6 @@ final class AppViewModel {
         }
     }
 
-    // MARK: - Admin
-
-    func loadUsers() {
-        guard user?.role == "admin" else { return }
-        Task {
-            do { adminUsers = try await api.users() } catch { self.error = error.localizedDescription }
-        }
-    }
-
-    func createUser(username: String, password: String, displayName: String, role: String) {
-        Task {
-            do {
-                try await api.createUser(username: username, password: password, displayName: displayName, role: role)
-                loadUsers()
-                toast = "成员已创建"
-            } catch {
-                self.error = error.localizedDescription
-                toast = "创建失败"
-            }
-        }
-    }
-
-    func updateUser(id: String, name: String, role: String, disabled: Bool, password: String? = nil) {
-        Task {
-            do {
-                try await api.updateUser(id: id, displayName: name, role: role, disabled: disabled, password: password)
-                loadUsers()
-                toast = "账号已更新"
-            } catch {
-                self.error = error.localizedDescription
-                toast = "更新失败"
-            }
-        }
-    }
-
     func changePassword(current: String, next: String) {
         Task {
             do {
@@ -743,8 +1107,121 @@ final class AppViewModel {
                 user = response.user
                 toast = "密码已修改"
             } catch {
-                self.error = error.localizedDescription
+                self.error = friendlyError(error, fallback: "密码修改失败") ?? "密码修改失败"
                 toast = "密码修改失败"
+            }
+        }
+    }
+
+    func regenerateRecoveryCode(currentPassword: String) {
+        Task {
+            do {
+                recoveryCode = try await api.regenerateRecoveryCode(currentPassword: currentPassword)
+            } catch {
+                toast = friendlyError(error, fallback: "获取恢复码失败") ?? "获取恢复码失败"
+            }
+        }
+    }
+
+    func ackRecoveryCode() { recoveryCode = nil }
+
+    // MARK: - Family
+
+    /// Best-effort, mirrors Web FamilyPanel's refresh(): family info only while a member,
+    /// pending invites only for personal accounts (regardless of membership).
+    func loadFamily() {
+        guard let user else { return }
+        Task {
+            familyInfo = user.familyId != nil ? try? await api.fetchFamily() : nil
+            if user.accountType == "personal" {
+                myInvites = (try? await api.myInvites()) ?? []
+            }
+        }
+    }
+
+    func createFamily(name: String) {
+        familyAction(key: "create", okToast: "家庭已创建") {
+            let response = try await self.api.createFamily(name: name.isEmpty ? nil : name)
+            if let updated = response.user { self.user = updated }
+        }
+    }
+
+    func sendFamilyInvite(username: String) {
+        familyAction(key: "invite", okToast: "邀请已发送") {
+            _ = try await self.api.sendFamilyInvite(username: username)
+        }
+    }
+
+    func revokeFamilyInvite(id: String) {
+        familyAction(key: "revoke:\(id)", okToast: "已撤回") {
+            try await self.api.revokeFamilyInvite(id: id)
+        }
+    }
+
+    func acceptInvite(id: String) {
+        familyAction(key: "accept:\(id)", okToast: "已加入家庭") {
+            let response = try await self.api.acceptInvite(id: id)
+            if let updated = response.user { self.user = updated }
+        }
+    }
+
+    func declineInvite(id: String) {
+        familyAction(key: "decline:\(id)", okToast: "已拒绝") {
+            try await self.api.declineInvite(id: id)
+        }
+    }
+
+    func leaveFamily() {
+        familyAction(key: "leave", okToast: "已退出家庭") {
+            let response = try await self.api.leaveFamily()
+            if let updated = response.user { self.user = updated }
+        }
+    }
+
+    func removeFamilyMember(id: String) {
+        familyAction(key: "remove:\(id)", okToast: "已移出家庭") {
+            try await self.api.removeFamilyMember(id: id)
+        }
+    }
+
+    /// Mirrors Web AccountManager's act(): single-flight by key, re-fetches family + people on
+    /// success (family membership changes the shared person registry), toasts on failure.
+    private func familyAction(key: String, okToast: String? = nil, _ action: @escaping () async throws -> Void) {
+        guard familyBusyKey == nil else { return }
+        familyBusyKey = key
+        Task {
+            defer { familyBusyKey = nil }
+            do {
+                try await action()
+                if let okToast { toast = okToast }
+                loadFamily()
+                loadPeople()
+            } catch {
+                toast = friendlyError(error, fallback: "操作失败") ?? "操作失败"
+            }
+        }
+    }
+
+    // MARK: - Relationship graph
+
+    func loadGraph() {
+        Task {
+            graphLoading = true
+            if let response = try? await api.graph() {
+                graphNodes = response.nodes
+                graphEdges = response.edges
+            }
+            graphLoading = false
+        }
+    }
+
+    func deleteGraphEdge(_ id: String) {
+        Task {
+            do {
+                try await api.deleteRelationship(id: id)
+                graphEdges.removeAll { $0.id == id }
+            } catch {
+                toast = "没删掉,稍后再试"
             }
         }
     }

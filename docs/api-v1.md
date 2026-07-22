@@ -68,9 +68,10 @@ Set `JWT_SECRET` (32+ random bytes hex) in production.
 
 | Method | Path | Notes |
 |--------|------|--------|
+| GET | `/entries/changes?since` | SSE 变更流(见下),仅 requireAuth |
 | GET | `/entries?cursor&limit&status&yearMonth` | paginated `{ items, nextCursor }` |
 | GET | `/entries/:id` | |
-| POST | `/entries` | multipart `meta` + `image` + `thumb`; owner forced from token |
+| POST | `/entries` | multipart `meta` + `image` + `thumb` (+ optional `override`); owner forced from token |
 | PATCH | `/entries/:id` | **whitelist only** (see below); cannot forge session fields |
 | DELETE | `/entries/:id` | |
 | GET | `/entries/:id/media/image` | jpeg |
@@ -79,7 +80,24 @@ Set `JWT_SECRET` (32+ random bytes hex) in production.
 | GET | `/entries/:id/faces` | people refs + unknown count |
 | GET | `/entries/:id/faces/:idx/thumb` | |
 
-`meta` JSON on create: `{ id, takenAt?, dateSource?, status? , ... }`. Server sets `ownerId`.
+`meta` JSON on create: `{ id, takenAt?, dateSource?, status?, clientUploadId?, ... }`. Server sets `ownerId`.
+
+### Upload idempotency & duplicate hint
+
+- `clientUploadId`(`[A-Za-z0-9._-]{1,128}`,建议 UUID):幂等键。同 owner 重放同一 `clientUploadId` → **200** + 已建 entry(不再新建);创建后不可改。
+- 同 owner 上传**相同图片字节**(sha256 命中)且未带 `override` → **409** `DUPLICATE_IMAGE`,body 额外带 `duplicateOf: { id, takenAt }`;客户端确认后带 `override=1` 重发即正常 201 新建。
+- 不同账号之间互不去重;entry `id` 冲突仍是 409 `CONFLICT`。
+
+### Change feed(同账号多设备同步)
+
+`GET /entries/changes?since=<seq>`,SSE 长连,**仅 requireAuth**(锁库时仍可开流;事件不含解密内容)。帧类型:
+
+- `{ type: "cursor", seq }` — 连上/补齐后的续传位置
+- `{ type: "change", seq, entryId, kind }` — `kind`: `created` | `updated` | `deleted`,仅本账号的 entry
+- `{ type: "resync", seq }` — 游标不可补齐(过期/重启),客户端应全量刷新
+- `{ type: "ping" }` — 心跳(约 25s)
+
+服务端约每 20 分钟主动关流,客户端带最后 seq 重连(指数退避);收到 change 建议防抖合并后再刷新。
 
 ### PATCH whitelist
 

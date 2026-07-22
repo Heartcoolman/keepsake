@@ -20,6 +20,8 @@ struct OverlayHost: View {
             )
         case .connection:
             ConnectionOverlay { shell.overlay = .account }
+        case .graph:
+            GraphOverlay { shell.overlay = nil }
         case nil:
             EmptyView()
         }
@@ -525,15 +527,10 @@ struct AccountOverlay: View {
 
     @State private var currentPassword = ""
     @State private var nextPassword = ""
-    @State private var newDisplayName = ""
-    @State private var newUsername = ""
-    @State private var newPassword = ""
-    @State private var newRole = "member"
-    @State private var editing: AuthUser?
 
     var body: some View {
         OverlayFrame(title: "✦ \(model.user?.displayName ?? "")", dismiss: dismiss) {
-            Text("@\(model.user?.username ?? "") · \(model.user?.role == "admin" ? "管理员" : "成员")")
+            Text("@\(model.user?.username ?? "") · \(model.user?.accountType == "family" ? "家庭账户" : "个人账户")")
                 .font(.system(size: 12))
                 .foregroundStyle(NxColors.textDim)
                 .padding(.bottom, 6)
@@ -553,6 +550,8 @@ struct AccountOverlay: View {
                     }, enabled: !currentPassword.isEmpty && nextPassword.count >= 8)
                     .frame(maxWidth: .infinity)
                     .padding(.top, 8)
+                    FamilyPanel()
+                    RecoveryCodeViewer()
                     SectionLabel(text: "连接")
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
@@ -564,73 +563,217 @@ struct AccountOverlay: View {
                     }
                     .padding(10)
                     .background(Color(argb: 0x08FFFFFF), in: RoundedRectangle(cornerRadius: 8))
-                    if model.user?.role == "admin" {
-                        SectionLabel(text: "家庭成员账号")
-                        adminSection
-                    }
                 }
                 .padding(.bottom, 12)
             }
             NxPill(text: "退出登录", action: model.logout)
                 .frame(maxWidth: .infinity)
         }
-        .task { model.loadUsers() }
+    }
+}
+
+/// Family membership panel, mirrors Web AccountManager.tsx's FamilyPanel: owner
+/// invites/removes; personal accounts see pending invites and can leave.
+struct FamilyPanel: View {
+    @Environment(AppViewModel.self) private var model
+    @State private var inviteName = ""
+    @State private var newFamilyName = ""
+    @State private var confirmRemove: AuthUser?
+    @State private var confirmLeave = false
+
+    private var isOwner: Bool { model.user?.accountType == "family" && model.user?.familyId != nil }
+    private var inFamily: Bool { model.user?.familyId != nil }
+
+    var body: some View {
+        SectionLabel(text: inFamily ? "家庭 · \(model.familyInfo?.family?.name ?? "")" : "家庭")
+        VStack(alignment: .leading, spacing: 8) {
+            if inFamily { membersList }
+            if isOwner {
+                ownerInvites
+                inviteForm
+            }
+            if model.user?.accountType == "family" && !inFamily {
+                createFamilyForm
+            }
+            if model.user?.accountType == "personal" && !inFamily {
+                personalInvites
+            }
+            if model.user?.accountType == "personal" && inFamily {
+                NxPill(
+                    text: model.familyBusyKey == "leave" ? "退出家庭…" : "退出家庭",
+                    action: { confirmLeave = true },
+                    enabled: model.familyBusyKey == nil
+                )
+            }
+        }
+        .task(id: model.user?.familyId) { model.loadFamily() }
         .overlay {
-            if let user = editing {
-                UserDialog(user: user, dismiss: { editing = nil }) { name, password, role, disabled in
-                    model.updateUser(id: user.id, name: name, role: role, disabled: disabled, password: password.isEmpty ? nil : password)
-                    editing = nil
+            if let member = confirmRemove {
+                ConfirmDialog(
+                    title: "把 \(member.displayName) 移出家庭？",
+                    body: "其个人数据保留，共享密钥将轮换。",
+                    confirm: "移出",
+                    dismiss: { confirmRemove = nil }
+                ) {
+                    model.removeFamilyMember(id: member.id)
+                    confirmRemove = nil
+                }
+            }
+            if confirmLeave {
+                ConfirmDialog(
+                    title: "退出家庭？",
+                    body: "你的照片与日记保留为个人数据，家庭共享的人物库将不再可见。",
+                    confirm: "退出",
+                    dismiss: { confirmLeave = false }
+                ) {
+                    model.leaveFamily()
+                    confirmLeave = false
                 }
             }
         }
     }
 
     @ViewBuilder
-    private var adminSection: some View {
-        ForEach(model.adminUsers) { user in
-            Button { editing = user } label: {
+    private var membersList: some View {
+        if let info = model.familyInfo {
+            ForEach(info.members) { member in
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(user.displayName).font(.system(size: 13)).foregroundStyle(NxColors.text)
-                        Text("@\(user.username) · \(user.role == "admin" ? "管理员" : "成员")\(user.disabled ? " · 已禁用" : "")")
+                        Text(member.displayName).font(.system(size: 13)).foregroundStyle(NxColors.text)
+                        Text("@\(member.username)\(member.id == info.family?.ownerId ? " · 家庭账户" : "")")
                             .font(.system(size: 10))
-                            .foregroundStyle(user.disabled ? NxColors.errorColor : NxColors.textFaint)
+                            .foregroundStyle(NxColors.textFaint)
                     }
                     Spacer()
-                    SmallAction(systemName: "pencil", label: "编辑") { editing = user }
+                    if isOwner && member.id != model.user?.id {
+                        NxPill(
+                            text: model.familyBusyKey == "remove:\(member.id)" ? "移出…" : "移出",
+                            action: { confirmRemove = member },
+                            enabled: model.familyBusyKey == nil
+                        )
+                    }
                 }
                 .padding(10)
                 .background(Color(argb: 0x08FFFFFF), in: RoundedRectangle(cornerRadius: 8))
             }
-            .buttonStyle(.plain)
-            .padding(.bottom, 6)
+        } else {
+            Text("加载中…").font(.system(size: 12)).foregroundStyle(NxColors.textFaint)
         }
-        VStack(spacing: 7) {
-            NxField(placeholder: "称呼", text: $newDisplayName, maxLength: 20)
-            NxField(placeholder: "用户名", text: $newUsername, maxLength: 32)
-            NxField(placeholder: "初始密码", text: $newPassword, password: true, maxLength: 128)
-            HStack(spacing: 7) {
-                NxPill(text: "成员", action: { newRole = "member" }, selected: newRole == "member")
-                NxPill(text: "管理员", action: { newRole = "admin" }, selected: newRole == "admin")
-                Spacer()
+    }
+
+    @ViewBuilder
+    private var ownerInvites: some View {
+        if let info = model.familyInfo, !info.invites.isEmpty {
+            ForEach(info.invites) { invite in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(invite.inviteeName).font(.system(size: 13)).foregroundStyle(NxColors.text)
+                        Text("邀请待接受").font(.system(size: 10)).foregroundStyle(NxColors.textFaint)
+                    }
+                    Spacer()
+                    NxPill(
+                        text: model.familyBusyKey == "revoke:\(invite.id)" ? "撤回…" : "撤回",
+                        action: { model.revokeFamilyInvite(id: invite.id) },
+                        enabled: model.familyBusyKey == nil
+                    )
+                }
+                .padding(10)
+                .background(Color(argb: 0x08FFFFFF), in: RoundedRectangle(cornerRadius: 8))
             }
-            NxPill(text: "创建账号", action: {
-                model.createUser(
-                    username: newUsername.trimmingCharacters(in: .whitespaces),
-                    password: newPassword,
-                    displayName: newDisplayName.trimmingCharacters(in: .whitespaces),
-                    role: newRole
-                )
-                newDisplayName = ""
-                newUsername = ""
-                newPassword = ""
-                newRole = "member"
-            }, enabled: !newDisplayName.trimmingCharacters(in: .whitespaces).isEmpty
-                && !newUsername.trimmingCharacters(in: .whitespaces).isEmpty
-                && newPassword.count >= 8, icon: "plus")
+        }
+    }
+
+    private var inviteForm: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            NxField(placeholder: "邀请个人账户 (用户名)", text: $inviteName)
+            NxPill(
+                text: model.familyBusyKey == "invite" ? "发出邀请…" : "发出邀请",
+                action: {
+                    model.sendFamilyInvite(username: inviteName.trimmingCharacters(in: .whitespaces))
+                    inviteName = ""
+                },
+                enabled: !inviteName.trimmingCharacters(in: .whitespaces).isEmpty && model.familyBusyKey == nil
+            )
+            .frame(maxWidth: .infinity)
+            Text("对方需先注册个人账户并登录过一次,接受邀请后即可共享人物库。")
+                .font(.system(size: 11))
+                .foregroundStyle(NxColors.textFaint)
+        }
+        .padding(.top, 4)
+    }
+
+    private var createFamilyForm: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("你的家庭已解散。可以创建一个新家庭,重新邀请成员。")
+                .font(.system(size: 11))
+                .foregroundStyle(NxColors.textFaint)
+            NxField(placeholder: "家庭名称 (可选)", text: $newFamilyName, maxLength: 20)
+            NxPill(
+                text: model.familyBusyKey == "create" ? "创建家庭 ✦…" : "创建家庭 ✦",
+                action: {
+                    model.createFamily(name: newFamilyName.trimmingCharacters(in: .whitespaces))
+                    newFamilyName = ""
+                },
+                selected: true, enabled: model.familyBusyKey == nil
+            )
             .frame(maxWidth: .infinity)
         }
-        .padding(.top, 5)
+    }
+
+    @ViewBuilder
+    private var personalInvites: some View {
+        if model.myInvites.isEmpty {
+            Text("独立使用中。收到家庭邀请会显示在这里。")
+                .font(.system(size: 12))
+                .foregroundStyle(NxColors.textFaint)
+        } else {
+            ForEach(model.myInvites) { invite in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(invite.familyName).font(.system(size: 13)).foregroundStyle(NxColors.text)
+                        Text("\(invite.inviterName) 邀请你加入").font(.system(size: 10)).foregroundStyle(NxColors.textFaint)
+                    }
+                    Spacer()
+                    NxPill(
+                        text: model.familyBusyKey == "accept:\(invite.id)" ? "接受…" : "接受",
+                        action: { model.acceptInvite(id: invite.id) },
+                        enabled: model.familyBusyKey == nil
+                    )
+                    NxPill(
+                        text: model.familyBusyKey == "decline:\(invite.id)" ? "拒绝…" : "拒绝",
+                        action: { model.declineInvite(id: invite.id) },
+                        enabled: model.familyBusyKey == nil
+                    )
+                }
+                .padding(10)
+                .background(Color(argb: 0x08FFFFFF), in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+}
+
+/// Rotate + reveal a fresh recovery code (needs the password; the old code dies).
+struct RecoveryCodeViewer: View {
+    @Environment(AppViewModel.self) private var model
+    @State private var currentPassword = ""
+
+    var body: some View {
+        SectionLabel(text: "恢复码")
+        VStack(alignment: .leading, spacing: 7) {
+            Text("生成新的恢复码并展示一次(旧码同时失效)。丢了密码和恢复码,数据无人能解。")
+                .font(.system(size: 11))
+                .foregroundStyle(NxColors.textFaint)
+            NxField(placeholder: "当前密码", text: $currentPassword, password: true, maxLength: 128)
+            NxPill(
+                text: "生成并查看恢复码",
+                action: {
+                    model.regenerateRecoveryCode(currentPassword: currentPassword)
+                    currentPassword = ""
+                },
+                enabled: !currentPassword.isEmpty
+            )
+            .frame(maxWidth: .infinity)
+        }
     }
 }
 
@@ -783,63 +926,22 @@ private struct PersonDialog: View {
     }
 }
 
-private struct UserDialog: View {
-    let user: AuthUser
-    let dismiss: () -> Void
-    let save: (String, String, String, Bool) -> Void
-    @State private var name = ""
-    @State private var password = ""
-    @State private var role = "member"
-    @State private var disabled = false
-
-    var body: some View {
-        DialogScrim(dismiss: dismiss) {
-            VStack(spacing: 8) {
-                Text("编辑账号").font(.nxSerif(18)).foregroundStyle(NxColors.text)
-                NxField(placeholder: "称呼", text: $name, maxLength: 20)
-                NxField(placeholder: "重置密码（可留空）", text: $password, password: true, maxLength: 128)
-                HStack(spacing: 7) {
-                    NxPill(text: "成员", action: { role = "member" }, selected: role == "member")
-                    NxPill(text: "管理员", action: { role = "admin" }, selected: role == "admin")
-                    Spacer()
-                }
-                Toggle(isOn: $disabled) {
-                    Text("禁用登录").font(.system(size: 13)).foregroundStyle(NxColors.textDim)
-                }
-                .tint(NxColors.paper)
-                HStack(spacing: 10) {
-                    NxPill(text: "取消", action: dismiss)
-                    NxPill(
-                        text: "保存",
-                        action: { save(name.trimmingCharacters(in: .whitespaces), password, role, disabled) },
-                        selected: true,
-                        enabled: !name.trimmingCharacters(in: .whitespaces).isEmpty
-                            && (password.isEmpty || password.count >= 8)
-                    )
-                }
-                .padding(.top, 6)
-            }
-            .padding(18)
-        }
-        .onAppear {
-            name = user.displayName
-            role = user.role
-            disabled = user.disabled
-        }
-    }
-}
-
-private struct ConfirmDialog: View {
+struct ConfirmDialog: View {
     let title: String
     let body_: String
     let confirm: String
+    let dismissLabel: String
     let dismiss: () -> Void
     let action: () -> Void
 
-    init(title: String, body: String, confirm: String, dismiss: @escaping () -> Void, action: @escaping () -> Void) {
+    init(
+        title: String, body: String, confirm: String, dismissLabel: String = "取消",
+        dismiss: @escaping () -> Void, action: @escaping () -> Void
+    ) {
         self.title = title
         self.body_ = body
         self.confirm = confirm
+        self.dismissLabel = dismissLabel
         self.dismiss = dismiss
         self.action = action
     }
@@ -850,7 +952,7 @@ private struct ConfirmDialog: View {
                 Text(title).font(.nxSerif(18)).foregroundStyle(NxColors.text)
                 Text(body_).font(.system(size: 13)).foregroundStyle(NxColors.textDim)
                 HStack(spacing: 10) {
-                    NxPill(text: "取消", action: dismiss)
+                    NxPill(text: dismissLabel, action: dismiss)
                     NxPill(text: confirm, action: action)
                 }
             }

@@ -34,6 +34,7 @@ import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.CircularProgressIndicator
@@ -61,6 +62,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.testTag
@@ -68,11 +70,14 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import coil.compose.AsyncImage
 import com.nianxiang.app.data.Entry
 import com.nianxiang.app.particle.ParticleSceneState
 import com.nianxiang.app.particle.ParticleView
 import com.nianxiang.app.particle.particleModeFor
+import kotlinx.coroutines.delay
 import kotlin.math.absoluteValue
 import kotlin.math.hypot
 import kotlin.math.min
@@ -83,6 +88,7 @@ private enum class AppOverlay {
     PROFILE,
     ACCOUNT,
     CONNECTION,
+    GRAPH,
 }
 
 @Composable
@@ -121,6 +127,10 @@ fun AppRoot(state: UiState, viewModel: AppViewModel) {
     DisposableEffect(Unit) {
         onDispose { particleView?.release() }
     }
+
+    // Drain triggers (b)/(c): app resumes to foreground, and stops observing connectivity once backgrounded.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.onAppForeground() }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { viewModel.onAppBackground() }
 
     NianxiangBackHandler(enabled = overlay != null) { overlay = null }
     LaunchedEffect(state.navigateToSession) {
@@ -174,6 +184,7 @@ fun AppRoot(state: UiState, viewModel: AppViewModel) {
                     },
                     openReview = { overlay = AppOverlay.REVIEW },
                     openPeople = { overlay = AppOverlay.PEOPLE },
+                    openGraph = { overlay = AppOverlay.GRAPH },
                     openAccount = { overlay = AppOverlay.ACCOUNT },
                 )
             }
@@ -195,7 +206,38 @@ fun AppRoot(state: UiState, viewModel: AppViewModel) {
                 openConnection = { overlay = AppOverlay.CONNECTION },
             )
             AppOverlay.CONNECTION -> ConnectionOverlay(state, viewModel) { overlay = AppOverlay.ACCOUNT }
+            AppOverlay.GRAPH -> GraphOverlay(state, viewModel) { overlay = null }
             null -> Unit
+        }
+
+        // Server-restart unlock gate: blocking, not outside-dismissable, sits above everything
+        // else including the overlay stack (mirrors Web's UserPickerOverlay locked branch).
+        if (state.locked) UnlockOverlay(state, viewModel)
+        // One-shot recovery code, shared by register/bootstrap/recover/unlock/regenerate.
+        RecoveryCodeModal(state.recoveryCode, viewModel::ackRecoveryCode)
+
+        if (state.duplicatePrompt) {
+            ConfirmDialog(
+                title = "照片已存在",
+                body = "这张照片已经有一条记忆，仍要新建一条吗？",
+                confirm = "仍新建",
+                dismiss = { viewModel.resolveDuplicatePrompt(false) },
+                dismissLabel = "跳过",
+            ) {
+                viewModel.resolveDuplicatePrompt(true)
+            }
+        }
+
+        if (state.pendingDecisionPrompt) {
+            ConfirmDialog(
+                title = "照片已存在",
+                body = "这张照片已经有一条记忆，仍要新建一条吗？",
+                confirm = "仍新建",
+                dismiss = { viewModel.resolvePendingDecisionChoice(false) },
+                dismissLabel = "跳过",
+            ) {
+                viewModel.resolvePendingDecisionChoice(true)
+            }
         }
     }
 }
@@ -274,14 +316,34 @@ internal fun Modifier.observeParticleGestures(enabled: Boolean, view: ParticleVi
     }
 }
 
+private enum class AuthView { LOGIN, REGISTER, RECOVER }
+
 @Composable
 private fun AuthScreen(state: UiState, viewModel: AppViewModel) {
+    var view by rememberSaveable { mutableStateOf(AuthView.LOGIN) }
     var username by rememberSaveable { mutableStateOf("") }
     // 密码不进 saved instance state：该 Bundle 会随进程回收明文落盘。
     var password by remember { mutableStateOf("") }
     var displayName by rememberSaveable { mutableStateOf("") }
+    var familyName by rememberSaveable { mutableStateOf("") }
+    var accountType by rememberSaveable { mutableStateOf("personal") }
+    var regCode by rememberSaveable { mutableStateOf("") }
+    var recoveryInput by rememberSaveable { mutableStateOf("") }
     var connectionOpen by rememberSaveable { mutableStateOf(false) }
     val bootstrap = state.bootstrapped == false
+
+    val heading = when {
+        bootstrap -> "✦ 首次启用"
+        view == AuthView.REGISTER -> "✦ 注册账户"
+        view == AuthView.RECOVER -> "✦ 用恢复码找回"
+        else -> "✦ 登录念想"
+    }
+    val subtitle = when {
+        bootstrap -> "创建第一个家庭账户,记忆将加密存放——连服务器管理者也读不到"
+        view == AuthView.REGISTER -> "家庭账户可以创建家庭并邀请他人;个人账户免费独立使用,也能接受家庭邀请"
+        view == AuthView.RECOVER -> "输入注册时保存的恢复码,并设置新密码"
+        else -> "输入用户名与密码"
+    }
 
     NxBackdrop {
         Box(
@@ -297,14 +359,9 @@ private fun AuthScreen(state: UiState, viewModel: AppViewModel) {
                     Modifier.padding(horizontal = 24.dp, vertical = 28.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
+                    Text(heading, color = NxColors.Text, fontFamily = NxSerif, fontSize = 25.sp)
                     Text(
-                        if (bootstrap) "✦ 首次启用" else "✦ 登录念想",
-                        color = NxColors.Text,
-                        fontFamily = NxSerif,
-                        fontSize = 25.sp,
-                    )
-                    Text(
-                        if (bootstrap) "创建管理员账号，记忆会锁在你的账户下" else "输入用户名与密码",
+                        subtitle,
                         color = NxColors.TextDim,
                         fontSize = 12.sp,
                         textAlign = TextAlign.Center,
@@ -313,10 +370,46 @@ private fun AuthScreen(state: UiState, viewModel: AppViewModel) {
                     if (bootstrap) {
                         NxField(displayName, { displayName = it }, "怎么称呼你?", Modifier.fillMaxWidth(), maxLength = 20)
                         Spacer(Modifier.height(10.dp))
+                        NxField(username, { username = it }, "用户名 (字母数字_)", Modifier.fillMaxWidth(), maxLength = 32)
+                        Spacer(Modifier.height(10.dp))
+                        NxField(password, { password = it }, "密码 (至少 8 位)", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+                    } else {
+                        when (view) {
+                            AuthView.LOGIN -> {
+                                NxField(username, { username = it }, "用户名 (字母数字_)", Modifier.fillMaxWidth(), maxLength = 32)
+                                Spacer(Modifier.height(10.dp))
+                                NxField(password, { password = it }, "密码 (至少 8 位)", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+                            }
+                            AuthView.REGISTER -> {
+                                Row(
+                                    Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    NxPill("个人账户", { accountType = "personal" }, selected = accountType == "personal")
+                                    NxPill("家庭账户", { accountType = "family" }, selected = accountType == "family")
+                                }
+                                Spacer(Modifier.height(10.dp))
+                                NxField(displayName, { displayName = it }, "怎么称呼你?", Modifier.fillMaxWidth(), maxLength = 20)
+                                Spacer(Modifier.height(10.dp))
+                                if (accountType == "family") {
+                                    NxField(familyName, { familyName = it }, "家庭名称 (可选)", Modifier.fillMaxWidth(), maxLength = 20)
+                                    Spacer(Modifier.height(10.dp))
+                                }
+                                NxField(username, { username = it }, "用户名 (字母数字_)", Modifier.fillMaxWidth(), maxLength = 32)
+                                Spacer(Modifier.height(10.dp))
+                                NxField(password, { password = it }, "密码 (至少 8 位)", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+                                Spacer(Modifier.height(10.dp))
+                                NxField(regCode, { regCode = it }, "注册码 (服务器未设置则留空)", Modifier.fillMaxWidth(), maxLength = 64)
+                            }
+                            AuthView.RECOVER -> {
+                                NxField(username, { username = it }, "用户名 (字母数字_)", Modifier.fillMaxWidth(), maxLength = 32)
+                                Spacer(Modifier.height(10.dp))
+                                NxField(recoveryInput, { recoveryInput = it }, "恢复码 (XXXX-XXXX-…)", Modifier.fillMaxWidth(), maxLength = 48)
+                                Spacer(Modifier.height(10.dp))
+                                NxField(password, { password = it }, "新密码 (至少 8 位)", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+                            }
+                        }
                     }
-                    NxField(username, { username = it }, "用户名 (字母数字_)", Modifier.fillMaxWidth(), maxLength = 32)
-                    Spacer(Modifier.height(10.dp))
-                    NxField(password, { password = it }, "密码 (至少 8 位)", Modifier.fillMaxWidth(), password = true, maxLength = 128)
                     state.error?.let {
                         Text(it, color = NxColors.Error, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
                     }
@@ -325,14 +418,41 @@ private fun AuthScreen(state: UiState, viewModel: AppViewModel) {
                         text = when {
                             state.loading -> "…"
                             bootstrap -> "启用 ✦"
+                            view == AuthView.REGISTER -> "注册 ✦"
+                            view == AuthView.RECOVER -> "找回 ✦"
                             else -> "进入 ✦"
                         },
                         onClick = {
-                            if (bootstrap) viewModel.bootstrap(username.trim(), password, displayName.trim())
-                            else viewModel.login(username.trim(), password)
+                            when {
+                                bootstrap -> viewModel.bootstrap(username.trim(), password, displayName.trim())
+                                view == AuthView.REGISTER -> viewModel.register(
+                                    accountType = accountType,
+                                    username = username.trim(),
+                                    password = password,
+                                    displayName = displayName.trim(),
+                                    familyName = familyName.trim(),
+                                    regCode = regCode.trim(),
+                                )
+                                view == AuthView.RECOVER -> viewModel.recover(username.trim(), recoveryInput.trim(), password)
+                                else -> viewModel.login(username.trim(), password)
+                            }
                         },
-                        enabled = !state.loading && username.isNotBlank() && password.length >= 8,
+                        enabled = !state.loading && username.isNotBlank() && password.length >= 8 &&
+                            (view != AuthView.RECOVER || recoveryInput.trim().length >= 8),
                     )
+                    if (!bootstrap) {
+                        Row(
+                            Modifier.padding(top = 14.dp),
+                            horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        ) {
+                            if (view != AuthView.LOGIN) {
+                                NxPill("返回登录", { view = AuthView.LOGIN })
+                            } else {
+                                NxPill("注册新账户", { view = AuthView.REGISTER })
+                                NxPill("忘记密码?", { view = AuthView.RECOVER })
+                            }
+                        }
+                    }
                     NxPill(
                         text = "连接设置",
                         onClick = { connectionOpen = true },
@@ -345,6 +465,98 @@ private fun AuthScreen(state: UiState, viewModel: AppViewModel) {
     if (connectionOpen) ConnectionOverlay(state, viewModel) { connectionOpen = false }
 }
 
+/** Blocking, not outside-dismissable: server restarted and its keyring is empty. Same session,
+ *  only escape hatch is the explicit logout button. */
+@Composable
+private fun UnlockOverlay(state: UiState, viewModel: AppViewModel) {
+    var password by remember { mutableStateOf("") }
+    Box(
+        Modifier.fillMaxSize().background(Color(0xE6060605)),
+        contentAlignment = Alignment.Center,
+    ) {
+        NxPanel(Modifier.fillMaxWidth(0.88f).widthIn(max = 420.dp)) {
+            Column(
+                Modifier.padding(horizontal = 22.dp, vertical = 26.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("✦ 需要解锁", color = NxColors.Text, fontFamily = NxSerif, fontSize = 22.sp)
+                Text(
+                    "服务器重启后,你的加密密钥已从内存清除。输入密码重新解锁" +
+                        (state.user?.let { "(@${it.username})" } ?: "") + "。",
+                    color = NxColors.TextDim,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 8.dp, bottom = 18.dp),
+                )
+                NxField(password, { password = it }, "密码", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+                state.error?.let {
+                    Text(it, color = NxColors.Error, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
+                }
+                Spacer(Modifier.height(16.dp))
+                NxPrimaryButton(
+                    text = if (state.loading) "…" else "解锁 ✦",
+                    onClick = { viewModel.unlock(password) },
+                    enabled = !state.loading && password.length >= 8,
+                )
+                NxPill("退出登录", viewModel::logout, modifier = Modifier.padding(top = 10.dp))
+            }
+        }
+    }
+}
+
+/** One-shot recovery code — never shown again, so it must be explicitly acknowledged
+ *  (a two-tap confirm, mirroring Web's arm/confirm dance) before it clears from state. */
+@Composable
+private fun RecoveryCodeModal(code: String?, ack: () -> Unit) {
+    if (code == null) return
+    var armed by remember(code) { mutableStateOf(false) }
+    LaunchedEffect(armed) {
+        if (armed) {
+            delay(3000)
+            armed = false
+        }
+    }
+    Box(
+        Modifier.fillMaxSize().background(Color(0xCC060605)),
+        contentAlignment = Alignment.Center,
+    ) {
+        NxPanel(Modifier.fillMaxWidth(0.88f).widthIn(max = 420.dp)) {
+            Column(
+                Modifier.padding(horizontal = 22.dp, vertical = 26.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("✦ 你的恢复码", color = NxColors.Text, fontFamily = NxSerif, fontSize = 22.sp)
+                Text(
+                    "忘记密码时,这是找回记忆的唯一方式。请立刻抄写或保存——它不会再次显示,服务器上也没有任何人能帮你找回。",
+                    color = NxColors.TextDim,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 8.dp, bottom = 16.dp),
+                )
+                SelectionContainer {
+                    Text(
+                        code,
+                        color = NxColors.Text,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 15.sp,
+                        letterSpacing = 1.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(NxColors.Control, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
+                NxPrimaryButton(
+                    text = if (armed) "再点一次,确认已保存" else "我已妥善保存 ✦",
+                    onClick = { if (armed) ack() else armed = true },
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun TimelineScreen(
     state: UiState,
@@ -352,6 +564,7 @@ private fun TimelineScreen(
     openEntry: (Entry) -> Unit,
     openReview: () -> Unit,
     openPeople: () -> Unit,
+    openGraph: () -> Unit,
     openAccount: () -> Unit,
 ) {
     var confirmDelete by rememberSaveable { mutableStateOf<String?>(null) }
@@ -385,8 +598,12 @@ private fun TimelineScreen(
             viewModel,
             openReview,
             openPeople,
+            openGraph,
             openAccount,
         )
+        if (state.pendingDecisionCount > 0) {
+            PendingDecisionBanner(state.pendingDecisionCount) { viewModel.resolvePendingDecisions() }
+        }
         state.error?.let { error ->
             Row(
                 Modifier.padding(horizontal = 18.dp, vertical = 4.dp),
@@ -489,11 +706,29 @@ internal fun MemoryCarousel(
 }
 
 @Composable
+private fun PendingDecisionBanner(count: Int, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(NxColors.Gold.copy(alpha = 0.14f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("$count 张照片待确认", color = NxColors.Text, fontSize = 12.sp, modifier = Modifier.weight(1f))
+        Text("查看 ›", color = NxColors.Gold, fontSize = 12.sp)
+    }
+}
+
+@Composable
 private fun TimelineToolbar(
     state: UiState,
     viewModel: AppViewModel,
     openReview: () -> Unit,
     openPeople: () -> Unit,
+    openGraph: () -> Unit,
     openAccount: () -> Unit,
 ) {
     Column(
@@ -516,6 +751,7 @@ private fun TimelineToolbar(
             NxPill(if (state.sortAscending) "⇅ 最早" else "⇅ 最近", viewModel::toggleSort)
             NxPill("✦ 回顾", openReview)
             NxPill("✧ 人物", openPeople)
+            NxPill("◈ 关系图谱", openGraph)
             NxPill("◐ ${state.user?.displayName ?: "选择使用者"}", openAccount)
         }
         NxSearchField(state.query, viewModel::setQuery, Modifier.fillMaxWidth())

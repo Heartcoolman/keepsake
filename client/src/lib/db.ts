@@ -2,7 +2,7 @@
 import { create } from 'zustand';
 import Dexie, { type Table } from 'dexie';
 import { entryTakenAt, type Entry } from './types';
-import { apiFetch } from './http';
+import { apiFetch, errorFromResponse } from './http';
 import { mediaPath } from './media';
 
 interface EntriesState {
@@ -86,14 +86,17 @@ export async function addEntry(
   entry: Entry,
   image: Blob,
   thumb: Blob,
-  opts: { refresh?: boolean } = {},
+  opts: { refresh?: boolean; clientUploadId?: string; override?: boolean } = {},
 ): Promise<void> {
   const form = new FormData();
-  form.set('meta', JSON.stringify(entry));
+  const meta = opts.clientUploadId ? { ...entry, clientUploadId: opts.clientUploadId } : entry;
+  form.set('meta', JSON.stringify(meta));
   form.set('image', image, 'image.jpg');
   form.set('thumb', thumb, 'thumb.jpg');
+  if (opts.override) form.set('override', '1');
   const res = await apiFetch('/api/v1/entries', { method: 'POST', body: form });
-  if (!res.ok) throw new Error(`add entry failed: ${res.status}`);
+  // 200 (idempotent replay of clientUploadId) counts as success alongside 201.
+  if (!res.ok) throw await errorFromResponse(res, 'add entry failed');
   // Batched callers (multi-file upload, legacy migration) refresh once at the end
   // instead of triggering a full re-fetch per entry.
   if (opts.refresh !== false) void refreshEntries({ userId: entry.userId });

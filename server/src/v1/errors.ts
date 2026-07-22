@@ -7,6 +7,9 @@ export type ErrorCode =
   | 'NOT_FOUND'
   | 'VALIDATION'
   | 'CONFLICT'
+  /** same-owner upload of identical image bytes — response carries a top-level
+   *  duplicateOf hint; resend with override to create anyway */
+  | 'DUPLICATE_IMAGE'
   | 'RATE_LIMITED'
   | 'PAYLOAD_TOO_LARGE'
   | 'UPSTREAM'
@@ -22,6 +25,7 @@ const STATUS: Record<ErrorCode, ContentfulStatusCode> = {
   NOT_FOUND: 404,
   VALIDATION: 400,
   CONFLICT: 409,
+  DUPLICATE_IMAGE: 409,
   RATE_LIMITED: 429,
   PAYLOAD_TOO_LARGE: 413,
   UPSTREAM: 502,

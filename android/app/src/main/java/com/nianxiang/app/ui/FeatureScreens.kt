@@ -27,7 +27,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
@@ -57,7 +56,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import com.nianxiang.app.data.AuthUser
 import com.nianxiang.app.data.FaceCluster
 import com.nianxiang.app.data.FaceRef
 import com.nianxiang.app.data.MemoryItem
@@ -579,16 +577,10 @@ fun AccountOverlay(
     // 密码不进 saved instance state：该 Bundle 会随进程回收明文落盘。
     var currentPassword by remember { mutableStateOf("") }
     var nextPassword by remember { mutableStateOf("") }
-    var displayName by rememberSaveable { mutableStateOf("") }
-    var username by rememberSaveable { mutableStateOf("") }
-    var initialPassword by remember { mutableStateOf("") }
-    var role by rememberSaveable { mutableStateOf("member") }
-    var editing by remember { mutableStateOf<AuthUser?>(null) }
-    LaunchedEffect(state.user?.role) { if (state.user?.role == "admin") viewModel.loadUsers() }
 
     OverlayFrame("✦ ${state.user?.displayName.orEmpty()}", dismiss) {
         Text(
-            "@${state.user?.username.orEmpty()} · ${if (state.user?.role == "admin") "管理员" else "成员"}",
+            "@${state.user?.username.orEmpty()} · ${if (state.user?.accountType == "family") "家庭账户" else "个人账户"}",
             color = NxColors.TextDim,
             fontSize = 12.sp,
             modifier = Modifier.align(Alignment.CenterHorizontally).padding(bottom = 6.dp),
@@ -621,64 +613,188 @@ fun AccountOverlay(
                     }
                     NxPill("连接设置", openConnection)
                 }
-                if (state.user?.role == "admin") {
-                    SectionLabel("家庭成员账号")
-                }
+                FamilyPanel(state, viewModel)
+                RecoveryCodeViewer(viewModel)
             }
-            if (state.user?.role == "admin") {
-                items(state.adminUsers, key = { it.id }) { user ->
-                    Row(
-                        Modifier.fillMaxWidth().padding(bottom = 6.dp).background(Color(0x08FFFFFF), RoundedCornerShape(8.dp))
-                            .clickable { editing = user }.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(user.displayName, color = NxColors.Text, fontSize = 13.sp)
-                            Text(
-                                "@${user.username} · ${if (user.role == "admin") "管理员" else "成员"}${if (user.disabled) " · 已禁用" else ""}",
-                                color = if (user.disabled) NxColors.Error else NxColors.TextFaint,
-                                fontSize = 10.sp,
-                            )
-                        }
-                        SmallAction(Icons.Default.Edit, "编辑", onClick = { editing = user })
+        }
+        NxPill("退出登录", viewModel::logout, modifier = Modifier.fillMaxWidth())
+    }
+}
+
+/** Family membership panel: owner invites/removes; personal accounts see pending invites
+ *  and can leave; a family account without a family can start a new one (mirrors Web's
+ *  AccountManager.tsx FamilyPanel). */
+@Composable
+private fun FamilyPanel(state: UiState, viewModel: AppViewModel) {
+    val user = state.user ?: return
+    val info = state.familyInfo
+    val isOwner = user.accountType == "family" && user.familyId != null
+    val inFamily = user.familyId != null
+    var inviteName by remember { mutableStateOf("") }
+    var newFamilyName by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf<Pair<String, () -> Unit>?>(null) }
+    val busyKey = state.familyBusyKey
+    LaunchedEffect(user.familyId) { viewModel.loadFamilyPanel() }
+
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+        SectionLabel(if (inFamily) "家庭 · ${info?.family?.name.orEmpty()}" else "家庭")
+
+        if (inFamily && info != null) {
+            info.members.forEach { member ->
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 6.dp).background(Color(0x08FFFFFF), RoundedCornerShape(8.dp)).padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(member.displayName, color = NxColors.Text, fontSize = 13.sp)
+                        Text(
+                            "@${member.username}${if (member.id == info.family?.ownerId) " · 家庭账户" else ""}",
+                            color = NxColors.TextFaint,
+                            fontSize = 10.sp,
+                        )
                     }
-                }
-                item {
-                    Column(Modifier.fillMaxWidth().padding(top = 5.dp)) {
-                        NxField(displayName, { displayName = it }, "称呼", Modifier.fillMaxWidth(), maxLength = 20)
-                        Spacer(Modifier.height(7.dp))
-                        NxField(username, { username = it }, "用户名", Modifier.fillMaxWidth(), maxLength = 32)
-                        Spacer(Modifier.height(7.dp))
-                        NxField(initialPassword, { initialPassword = it }, "初始密码", Modifier.fillMaxWidth(), password = true, maxLength = 128)
-                        Row(Modifier.padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                            NxPill("成员", { role = "member" }, selected = role == "member")
-                            NxPill("管理员", { role = "admin" }, selected = role == "admin")
-                        }
+                    if (isOwner && member.id != user.id) {
                         NxPill(
-                            "创建账号",
+                            if (busyKey == "remove:${member.id}") "移出…" else "移出",
                             {
-                                viewModel.createUser(username.trim(), initialPassword, displayName.trim(), role)
-                                displayName = ""
-                                username = ""
-                                initialPassword = ""
-                                role = "member"
+                                confirm = "把 ${member.displayName} 移出家庭?其个人数据保留,共享密钥将轮换。" to {
+                                    viewModel.removeFamilyMember(member.id)
+                                }
                             },
-                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                            enabled = displayName.isNotBlank() && username.isNotBlank() && initialPassword.length >= 8,
-                            icon = Icons.Default.Add,
+                            enabled = busyKey == null,
                         )
                     }
                 }
             }
         }
-        NxPill("退出登录", viewModel::logout, modifier = Modifier.fillMaxWidth())
+
+        if (isOwner) {
+            info?.invites?.forEach { invite ->
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 6.dp).background(Color(0x08FFFFFF), RoundedCornerShape(8.dp)).padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(invite.inviteeName, color = NxColors.Text, fontSize = 13.sp)
+                        Text("邀请待接受", color = NxColors.TextFaint, fontSize = 10.sp)
+                    }
+                    NxPill(
+                        if (busyKey == "revoke:${invite.id}") "撤回…" else "撤回",
+                        { viewModel.revokeFamilyInvite(invite.id) },
+                        enabled = busyKey == null,
+                    )
+                }
+            }
+            Spacer(Modifier.height(7.dp))
+            NxField(inviteName, { inviteName = it }, "邀请个人账户 (用户名)", Modifier.fillMaxWidth(), maxLength = 32)
+            NxPill(
+                if (busyKey == "invite") "发出邀请…" else "发出邀请",
+                {
+                    viewModel.sendFamilyInvite(inviteName.trim())
+                    inviteName = ""
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                enabled = inviteName.isNotBlank() && busyKey == null,
+            )
+            Text(
+                "对方需先注册个人账户并登录过一次,接受邀请后即可共享人物库。",
+                color = NxColors.TextFaint,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+
+        if (user.accountType == "family" && !inFamily) {
+            Text("你的家庭已解散。可以创建一个新家庭,重新邀请成员。", color = NxColors.TextDim, fontSize = 12.sp)
+            Spacer(Modifier.height(7.dp))
+            NxField(newFamilyName, { newFamilyName = it }, "家庭名称 (可选)", Modifier.fillMaxWidth(), maxLength = 20)
+            NxPill(
+                if (busyKey == "create") "创建家庭 ✦…" else "创建家庭 ✦",
+                {
+                    viewModel.createFamily(newFamilyName.trim().ifBlank { null })
+                    newFamilyName = ""
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                enabled = busyKey == null,
+            )
+        }
+
+        if (user.accountType == "personal" && !inFamily) {
+            if (state.myInvites.isEmpty()) {
+                Text("独立使用中。收到家庭邀请会显示在这里。", color = NxColors.TextFaint, fontSize = 12.sp)
+            }
+            state.myInvites.forEach { invite ->
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 6.dp).background(Color(0x08FFFFFF), RoundedCornerShape(8.dp)).padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(invite.familyName, color = NxColors.Text, fontSize = 13.sp)
+                        Text("${invite.inviterName} 邀请你加入", color = NxColors.TextFaint, fontSize = 10.sp)
+                    }
+                    NxPill(
+                        if (busyKey == "accept:${invite.id}") "接受…" else "接受",
+                        { viewModel.acceptInvite(invite.id) },
+                        enabled = busyKey == null,
+                    )
+                    NxPill(
+                        if (busyKey == "decline:${invite.id}") "拒绝…" else "拒绝",
+                        { viewModel.declineInvite(invite.id) },
+                        enabled = busyKey == null,
+                        modifier = Modifier.padding(start = 6.dp),
+                    )
+                }
+            }
+        }
+
+        if (user.accountType == "personal" && inFamily) {
+            NxPill(
+                if (busyKey == "leave") "退出家庭…" else "退出家庭",
+                {
+                    confirm = "退出家庭?你的照片与日记保留为个人数据,家庭共享的人物库将不再可见。" to {
+                        viewModel.leaveFamily()
+                    }
+                },
+                enabled = busyKey == null,
+            )
+        }
     }
 
-    editing?.let { user ->
-        UserDialog(user, { editing = null }) { name, _, password, nextRole, disabled ->
-            viewModel.updateUser(user.id, name, nextRole, disabled, password.ifBlank { null })
-            editing = null
+    confirm?.let { (message, onConfirm) ->
+        ConfirmDialog(
+            title = "确认",
+            body = message,
+            confirm = "确认",
+            dismiss = { confirm = null },
+        ) {
+            confirm = null
+            onConfirm()
         }
+    }
+}
+
+/** Rotate + reveal a fresh recovery code (needs the current password; the old code dies). */
+@Composable
+private fun RecoveryCodeViewer(viewModel: AppViewModel) {
+    var current by remember { mutableStateOf("") }
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+        SectionLabel("恢复码")
+        Text(
+            "生成新的恢复码并展示一次(旧码同时失效)。丢了密码和恢复码,数据无人能解。",
+            color = NxColors.TextDim,
+            fontSize = 12.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        NxField(current, { current = it }, "当前密码", Modifier.fillMaxWidth(), password = true, maxLength = 128)
+        NxPill(
+            "生成并查看恢复码",
+            {
+                viewModel.regenerateRecoveryCode(current)
+                current = ""
+            },
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            enabled = current.isNotBlank(),
+        )
     }
 }
 
@@ -815,63 +931,6 @@ internal fun FaceNamerDialog(
 }
 
 @Composable
-private fun UserDialog(
-    user: AuthUser?,
-    dismiss: () -> Unit,
-    save: (String, String, String, String, Boolean) -> Unit,
-) {
-    var name by remember(user?.id) { mutableStateOf(user?.displayName.orEmpty()) }
-    var username by remember(user?.id) { mutableStateOf(user?.username.orEmpty()) }
-    var password by remember(user?.id) { mutableStateOf("") }
-    var role by remember(user?.id) { mutableStateOf(user?.role ?: "member") }
-    var disabled by remember(user?.id) { mutableStateOf(user?.disabled ?: false) }
-    AlertDialog(
-        onDismissRequest = dismiss,
-        containerColor = NxColors.PanelSolid,
-        shape = RoundedCornerShape(14.dp),
-        title = { Text(if (user == null) "创建成员" else "编辑账号", fontFamily = NxSerif) },
-        text = {
-            Column {
-                NxField(name, { name = it }, "称呼", Modifier.fillMaxWidth(), maxLength = 20)
-                Spacer(Modifier.height(8.dp))
-                NxField(username, { username = it }, "用户名", Modifier.fillMaxWidth(), enabled = user == null, maxLength = 32)
-                Spacer(Modifier.height(8.dp))
-                NxField(
-                    password,
-                    { password = it },
-                    if (user == null) "初始密码" else "重置密码（可留空）",
-                    Modifier.fillMaxWidth(),
-                    password = true,
-                    maxLength = 128,
-                )
-                Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    NxPill("成员", { role = "member" }, selected = role == "member")
-                    NxPill("管理员", { role = "admin" }, selected = role == "admin")
-                }
-                if (user != null) {
-                    Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("禁用登录", color = NxColors.TextDim, modifier = Modifier.weight(1f))
-                        Switch(
-                            checked = disabled,
-                            onCheckedChange = { disabled = it },
-                            colors = SwitchDefaults.colors(checkedThumbColor = NxColors.OnPaper, checkedTrackColor = NxColors.Paper),
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { save(name.trim(), username.trim(), password, role, disabled) },
-                enabled = name.isNotBlank() && username.isNotBlank() && (user != null || password.length >= 8) &&
-                    (password.isBlank() || password.length >= 8),
-            ) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = dismiss) { Text("取消") } },
-    )
-}
-
-@Composable
 private fun SmallAction(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     description: String,
@@ -896,11 +955,12 @@ private fun EmptyFeature(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ConfirmDialog(
+internal fun ConfirmDialog(
     title: String,
     body: String,
     confirm: String,
     dismiss: () -> Unit,
+    dismissLabel: String = "取消",
     action: () -> Unit,
 ) {
     AlertDialog(
@@ -910,7 +970,7 @@ private fun ConfirmDialog(
         title = { Text(title, fontFamily = NxSerif) },
         text = { Text(body, color = NxColors.TextDim) },
         confirmButton = { TextButton(onClick = action) { Text(confirm, color = NxColors.Error) } },
-        dismissButton = { TextButton(onClick = dismiss) { Text("取消") } },
+        dismissButton = { TextButton(onClick = dismiss) { Text(dismissLabel) } },
     )
 }
 

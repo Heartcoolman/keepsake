@@ -107,11 +107,25 @@ export const TEST_JPEG = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], {
   type: 'image/jpeg',
 });
 
-export function uploadForm(entryId: string, takenAt = Date.now()): FormData {
+/** distinct-but-valid JPEG bytes per seed — for dedup tests that need unique hashes */
+export const testJpeg = (seed: number) =>
+  new Blob([new Uint8Array([0xff, 0xd8, 0xff, seed & 0xff, 0xff, 0xd9])], {
+    type: 'image/jpeg',
+  });
+
+export interface UploadFormOpts {
+  meta?: Record<string, unknown>;
+  image?: Blob;
+  thumb?: Blob;
+  override?: boolean;
+}
+
+export function uploadForm(entryId: string, takenAt = Date.now(), opts: UploadFormOpts = {}): FormData {
   const form = new FormData();
-  form.set('meta', JSON.stringify({ id: entryId, takenAt, status: 'new' }));
-  form.set('image', TEST_JPEG, 'image.jpg');
-  form.set('thumb', TEST_JPEG, 'thumb.jpg');
+  form.set('meta', JSON.stringify({ id: entryId, takenAt, status: 'new', ...opts.meta }));
+  form.set('image', opts.image ?? TEST_JPEG, 'image.jpg');
+  form.set('thumb', opts.thumb ?? TEST_JPEG, 'thumb.jpg');
+  if (opts.override) form.set('override', '1');
   return form;
 }
 

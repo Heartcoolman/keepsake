@@ -18,6 +18,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.parameter
 import io.ktor.client.request.patch
 import io.ktor.client.request.post
+import io.ktor.client.request.prepareGet
 import io.ktor.client.request.preparePost
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
@@ -32,6 +33,7 @@ import io.ktor.serialization.kotlinx.json.json
 import io.ktor.utils.io.readUTF8Line
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.sync.Mutex
@@ -50,6 +52,11 @@ import java.util.UUID
 
 class ApiClient(private val session: SessionStore) {
     private val refreshMutex = Mutex()
+
+    /** Fires when any request comes back 423 E_KEYS_LOCKED: token is fine but the server
+     *  keyring is empty (restart). Only a notification — the caller still sees the thrown
+     *  ApiException and the unlock overlay takes over the UI; this never retries the request. */
+    val keysLocked = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -134,8 +141,16 @@ class ApiClient(private val session: SessionStore) {
 
     private suspend fun apiError(res: HttpResponse): Exception {
         val text = runCatching { res.bodyAsText() }.getOrDefault(res.status.description)
-        val parsed = runCatching { json.decodeFromString<ErrorBody>(text).error }.getOrNull()
-        return ApiException(res.status.value, parsed?.code.orEmpty(), parsed?.message ?: text)
+        val parsed = runCatching { json.decodeFromString<ErrorBody>(text) }.getOrNull()
+        val code = parsed?.error?.code.orEmpty()
+        if (res.status.value == 423 && code == "E_KEYS_LOCKED") keysLocked.tryEmit(Unit)
+        return ApiException(
+            res.status.value,
+            code,
+            parsed?.error?.message ?: text,
+            parsed?.duplicateOf?.id,
+            parsed?.duplicateOf?.takenAt,
+        )
     }
 
     suspend fun health(): HealthResponse =
@@ -176,7 +191,95 @@ class ApiClient(private val session: SessionStore) {
         session.clearSession()
     }
 
-    suspend fun me(): AuthUser = get<MeResponse>("/api/v1/auth/me").user
+    suspend fun me(): MeResponse = get("/api/v1/auth/me")
+
+    suspend fun register(
+        accountType: String,
+        username: String,
+        password: String,
+        displayName: String? = null,
+        familyName: String? = null,
+        regCode: String? = null,
+    ): AuthResponse {
+        val body = post<AuthResponse>(
+            "/api/v1/auth/register",
+            buildJsonObject {
+                put("accountType", accountType)
+                put("username", username)
+                put("password", password)
+                if (!displayName.isNullOrBlank()) put("displayName", displayName)
+                if (!familyName.isNullOrBlank()) put("familyName", familyName)
+                if (!regCode.isNullOrBlank()) put("regCode", regCode)
+            },
+            skipAuth = true,
+        )
+        session.setSession(body.accessToken, body.refreshToken, body.user)
+        return body
+    }
+
+    /** Server restarted and lost its in-memory keys: re-enter the password, same session. */
+    suspend fun unlock(password: String): UnlockResponse =
+        post("/api/v1/auth/unlock", buildJsonObject { put("password", password) })
+
+    suspend fun recover(username: String, recoveryCode: String, newPassword: String): AuthResponse {
+        val body = post<AuthResponse>(
+            "/api/v1/auth/recover",
+            buildJsonObject {
+                put("username", username)
+                put("recoveryCode", recoveryCode)
+                put("newPassword", newPassword)
+            },
+            skipAuth = true,
+        )
+        session.setSession(body.accessToken, body.refreshToken, body.user)
+        return body
+    }
+
+    suspend fun regenerateRecoveryCode(currentPassword: String): String =
+        post<RecoveryCodeResponse>(
+            "/api/v1/auth/me/recovery-code",
+            buildJsonObject { put("currentPassword", currentPassword) },
+        ).recoveryCode
+
+    // ---------- family / invites ----------
+
+    suspend fun fetchFamily(): FamilyInfo = get("/api/v1/family")
+
+    suspend fun createFamily(name: String? = null): FamilyActionResponse =
+        post("/api/v1/family", buildJsonObject { if (!name.isNullOrBlank()) put("name", name) })
+
+    suspend fun sendFamilyInvite(username: String): FamilyInvite =
+        post("/api/v1/family/invites", buildJsonObject { put("username", username) })
+
+    suspend fun revokeFamilyInvite(id: String) {
+        deleteUnit("/api/v1/family/invites/$id")
+    }
+
+    suspend fun myInvites(): List<MyInvite> = get<MyInvitePage>("/api/v1/me/invites").items
+
+    suspend fun acceptInvite(id: String): FamilyActionResponse =
+        post("/api/v1/me/invites/$id/accept", buildJsonObject {})
+
+    suspend fun declineInvite(id: String) {
+        post<OkResponse>("/api/v1/me/invites/$id/decline", buildJsonObject {})
+    }
+
+    suspend fun leaveFamily(): FamilyActionResponse =
+        post("/api/v1/me/family/leave", buildJsonObject {})
+
+    suspend fun removeFamilyMember(id: String) {
+        deleteUnit("/api/v1/family/members/$id")
+    }
+
+    // ---------- relationship graph ----------
+
+    suspend fun graph(): GraphResponse = get("/api/v1/graph")
+
+    suspend fun deleteRelationship(id: String) {
+        var res = client.delete("${base()}/api/v1/relationships/$id") { auth() }
+        if (refreshIfNeeded(res)) res = client.delete("${base()}/api/v1/relationships/$id") { auth() }
+        if (!res.status.isSuccess() && res.status.value != 404) throw apiError(res)
+    }
 
     suspend fun listEntries(cursor: String? = null, limit: Int = 50): EntryPage {
         var res = client.get("${base()}/api/v1/entries") {
@@ -197,13 +300,14 @@ class ApiClient(private val session: SessionStore) {
 
     suspend fun getEntry(id: String): Entry = get("/api/v1/entries/$id")
 
-    suspend fun uploadEntry(meta: Entry, jpeg: ByteArray, thumb: ByteArray): Entry {
+    suspend fun uploadEntry(meta: Entry, jpeg: ByteArray, thumb: ByteArray, override: Boolean = false): Entry {
         suspend fun once() = client.post("${base()}/api/v1/entries") {
             auth()
             setBody(
                 MultiPartFormDataContent(
                     formData {
                         append("meta", json.encodeToString(meta))
+                        if (override) append("override", "1")
                         append(
                             "image",
                             jpeg,
@@ -305,6 +409,48 @@ class ApiClient(private val session: SessionStore) {
     fun streamMonthly(yearMonth: String): Flow<String> =
         streamSse("/api/v1/monthly/$yearMonth/generate", buildJsonObject {})
 
+    /**
+     * GET-shaped SSE (unlike [streamSse], which is POST-shaped): one streaming connection to
+     * the change feed starting at [since]. Emits every frame (cursor/change/resync/ping) as
+     * they arrive; completes normally on a clean server-side close, throws on network failure.
+     * Reconnect policy (backoff, resuming from the last seen seq) is the caller's job.
+     */
+    fun changeFeed(since: Long): Flow<ChangeEvent> = flow {
+        var refreshed = false
+        while (true) {
+            var retry = false
+            client.prepareGet("${base()}/api/v1/entries/changes") {
+                auth()
+                parameter("since", since)
+                header(HttpHeaders.Accept, "text/event-stream")
+                timeout {
+                    requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+                    socketTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+                }
+            }.execute { response ->
+                if (response.status.value == 401 && !refreshed && refreshIfNeeded(response)) {
+                    retry = true
+                    return@execute
+                }
+                if (!response.status.isSuccess()) throw apiError(response)
+                val channel = response.bodyAsChannel()
+                while (!channel.isClosedForRead) {
+                    val line = channel.readUTF8Line() ?: break
+                    if (!line.startsWith("data:")) continue
+                    val data = line.removePrefix("data:").trim()
+                    if (data.isEmpty()) continue
+                    val event = runCatching { json.decodeFromString<ChangeEvent>(data) }.getOrNull() ?: continue
+                    emit(event)
+                }
+            }
+            if (retry) {
+                refreshed = true
+                continue
+            }
+            break
+        }
+    }.flowOn(Dispatchers.IO)
+
     suspend fun getMonthly(yearMonth: String): MonthlyReview? {
         val res = client.get("${base()}/api/v1/monthly/$yearMonth") { auth() }
         if (res.status.value == 404) return null
@@ -387,35 +533,6 @@ class ApiClient(private val session: SessionStore) {
     suspend fun deleteMemory(id: String): ProfileData = deleteJson("/api/v1/me/memories/$id")
 
     suspend fun users(): List<AuthUser> = get<UserPage>("/api/v1/users").items
-
-    suspend fun createUser(
-        username: String,
-        password: String,
-        displayName: String,
-        role: String,
-    ): AuthUser = post<UserResponse>("/api/v1/users", buildJsonObject {
-        put("username", username)
-        put("password", password)
-        put("displayName", displayName)
-        put("role", role)
-    }).user
-
-    suspend fun updateUser(
-        id: String,
-        displayName: String? = null,
-        role: String? = null,
-        disabled: Boolean? = null,
-        password: String? = null,
-    ): AuthUser = patchJson<UserResponse>("/api/v1/users/$id", buildJsonObject {
-        if (displayName != null) put("displayName", displayName)
-        if (role != null) put("role", role)
-        if (disabled != null) put("disabled", disabled)
-        if (!password.isNullOrBlank()) put("password", password)
-    }).user
-
-    suspend fun disableUser(id: String) {
-        deleteJson<OkResponse>("/api/v1/users/$id")
-    }
 
     suspend fun changePassword(currentPassword: String, newPassword: String): AuthResponse {
         val body = patchJson<AuthResponse>("/api/v1/auth/me/password", buildJsonObject {

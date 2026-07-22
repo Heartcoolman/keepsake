@@ -35,6 +35,9 @@ struct NianxiangApp: App {
                 Button("人物") { shell.overlay = .people }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(model.user == nil)
+                Button("关系图谱") { shell.overlay = .graph }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(model.user == nil)
                 Button("账号") { shell.overlay = .account }
                     .keyboardShortcut(",", modifiers: [.command, .shift])
                     .disabled(model.user == nil)
@@ -49,7 +52,7 @@ struct NianxiangApp: App {
 }
 
 enum AppOverlay {
-    case review, people, profile, account, connection
+    case review, people, profile, account, connection, graph
 }
 
 /// Cross-view shell signals (menu commands, overlay routing).
