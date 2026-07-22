@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  LAN self-hosted servers commonly serve plain HTTP on a private IP, so cleartext
+  must remain possible. Android's network security config cannot express
+  "private ranges only" (no CIDR support), so the real restriction is enforced at
+  runtime by SessionStore.validBaseUrl: it permits cleartext ONLY for
+  localhost / *.local / RFC1918 IPv4 and forces HTTPS for any public host.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

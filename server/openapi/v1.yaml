@@ -1,0 +1,637 @@
+openapi: 3.1.0
+info:
+  title: Nianxiang API
+  version: "1"
+  description: |
+    Self-hosted memory diary API.
+    Auth via Bearer JWT. Entries are strictly owner-isolated; people are household-shared.
+servers:
+  - url: /api/v1
+paths:
+  /health:
+    get:
+      summary: Liveness + bootstrap status
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  mock: { type: boolean }
+                  apiVersion: { type: integer }
+                  authRequired: { type: boolean }
+                  bootstrapped: { type: boolean }
+  /auth/bootstrap:
+    post:
+      summary: Create first admin (only when no accounts exist)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BootstrapRequest"
+      responses:
+        "200":
+          description: Tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "409":
+          $ref: "#/components/responses/Error"
+  /auth/login:
+    post:
+      summary: Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+  /auth/refresh:
+    post:
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+  /auth/logout:
+    post:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Token version bumped
+  /auth/me:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+  /auth/me/password:
+    patch:
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "200": { description: Password changed and replacement tokens issued }
+        "401": { $ref: "#/components/responses/Error" }
+  /users:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Household accounts without password hashes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: "#/components/schemas/User" } }
+    post:
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUserRequest" }
+      responses:
+        "201": { description: Account created }
+        "403": { $ref: "#/components/responses/Error" }
+  /users/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    patch:
+      security: [{ bearerAuth: [] }]
+      description: Admin updates display name, role, disabled state, or resets password
+      responses:
+        "200": { description: Account updated }
+        "409": { $ref: "#/components/responses/Error" }
+    delete:
+      security: [{ bearerAuth: [] }]
+      description: Soft-disable an account
+      responses:
+        "200": { description: Account disabled }
+        "409": { $ref: "#/components/responses/Error" }
+  /entries:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - in: query
+          name: cursor
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100 }
+        - in: query
+          name: status
+          schema: { type: string, enum: [new, chatting, done] }
+        - in: query
+          name: yearMonth
+          schema: { type: string, pattern: '^\d{4}-\d{2}$' }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntryPage"
+    post:
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [meta, image, thumb]
+              properties:
+                meta: { type: string, description: JSON Entry create fields }
+                image: { type: string, format: binary }
+                thumb: { type: string, format: binary }
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+  /entries/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+    patch:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Entry"
+    delete:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Deleted
+  /entries/{id}/media/{kind}:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+        - in: path
+          name: kind
+          required: true
+          schema: { type: string, enum: [image, thumb] }
+      responses:
+        "200":
+          description: JPEG bytes
+          content:
+            image/jpeg:
+              schema: { type: string, format: binary }
+  /entries/{id}/depth:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      responses:
+        "200":
+          description: Depth layers JSON
+        "503":
+          $ref: "#/components/responses/Error"
+  /entries/{id}/faces:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      responses:
+        "200": { description: Known person references and unknown face count }
+  /entries/{id}/faces/{faceIndex}/thumb:
+    get:
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+        - in: path
+          name: faceIndex
+          required: true
+          schema: { type: integer, minimum: 0, maximum: 19 }
+      responses:
+        "200":
+          description: Face crop JPEG
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+  /entries/{id}/session/open:
+    post:
+      summary: Idempotent session open (ensure analyze + opener)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force: { type: boolean }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entry, analysis]
+                properties:
+                  entry: { $ref: "#/components/schemas/Entry" }
+                  analysis:
+                    type: object
+                    properties:
+                      status: { type: string, enum: [skipped, cached, generated, forced] }
+                      reason: { type: string }
+  /entries/{id}/session/message:
+    post:
+      summary: Append user message and stream assistant reply (server chat SoT)
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        "200":
+          description: SSE v1 stream (delta/done)
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "409":
+          $ref: "#/components/responses/Error"
+  /entries/{id}/session/complete:
+    post:
+      summary: Generate diary from server chat and mark done
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force: { type: boolean }
+      responses:
+        "200":
+          description: SSE v1 stream, or JSON {entry,skipped} when already done
+          content:
+            text/event-stream:
+              schema: { type: string }
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entry: { $ref: "#/components/schemas/Entry" }
+                  skipped: { type: boolean }
+        "409":
+          $ref: "#/components/responses/Error"
+  /entries/{id}/analyze:
+    post:
+      summary: Legacy analyze (prefer session/open)
+      deprecated: true
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force: { type: boolean }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnalyzeResult"
+  /entries/{id}/chat:
+    post:
+      summary: Legacy chat (prefer session/message)
+      deprecated: true
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  items: { $ref: "#/components/schemas/ChatMessage" }
+      responses:
+        "200":
+          description: SSE v1 stream (delta/done)
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /entries/{id}/diary:
+    post:
+      summary: Legacy diary (prefer session/complete)
+      deprecated: true
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Id"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  items: { $ref: "#/components/schemas/ChatMessage" }
+                dateStr: { type: string }
+                mood: { type: string }
+      responses:
+        "200":
+          description: SSE v1 stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /people:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Person" }
+    post:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "201":
+          description: Created person
+  /people/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    patch:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Person updated }
+    delete:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Person deleted and entry references removed }
+  /people/{id}/merge:
+    post:
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: "#/components/parameters/Id" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromId]
+              properties: { fromId: { type: string } }
+      responses:
+        "200": { description: People merged and entry references rewritten }
+  /faces/unassigned:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Face clusters containing only the caller's entries
+  /me/profile:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Profile + memories
+    patch:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Updated profile
+  /me/memories/{memId}:
+    parameters:
+      - in: path
+        name: memId
+        required: true
+        schema: { type: string }
+    patch:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Memory edited }
+    delete:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Memory deleted }
+  /monthly/{yearMonth}:
+    parameters: [{ $ref: "#/components/parameters/YearMonth" }]
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200": { description: Saved monthly review }
+        "404": { $ref: "#/components/responses/Error" }
+  /monthly/{yearMonth}/generate:
+    parameters: [{ $ref: "#/components/parameters/YearMonth" }]
+    post:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: SSE v1 stream
+          content:
+            text/event-stream: { schema: { type: string } }
+  /config:
+    get:
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Client config
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Id:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+    YearMonth:
+      in: path
+      name: yearMonth
+      required: true
+      schema: { type: string, pattern: '^\d{4}-(0[1-9]|1[0-2])$' }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorBody"
+  schemas:
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        username: { type: string }
+        displayName: { type: string }
+        role: { type: string, enum: [admin, member] }
+        disabled: { type: boolean }
+        createdAt: { type: number }
+        updatedAt: { type: number }
+    BootstrapRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, minLength: 8 }
+        displayName: { type: string }
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+    CreateUserRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, pattern: '^[a-zA-Z0-9_]{3,32}$' }
+        password: { type: string, minLength: 8, maxLength: 128 }
+        displayName: { type: string, maxLength: 40 }
+        role: { type: string, enum: [admin, member] }
+    AuthResponse:
+      type: object
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        expiresIn: { type: integer }
+        user: { $ref: "#/components/schemas/User" }
+    ChatMessage:
+      type: object
+      properties:
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+    Entry:
+      type: object
+      properties:
+        id: { type: string }
+        ownerId: { type: string }
+        userId: { type: string, description: "Legacy alias of ownerId" }
+        takenAt: { type: number }
+        createdAt: { type: number }
+        uploadedAt: { type: number }
+        dateSource: { type: string }
+        yearMonth: { type: string }
+        status: { type: string, enum: [new, chatting, done] }
+        title: { type: string }
+        mood: { type: string }
+        diaryText: { type: string }
+        imageDescription: { type: string }
+        chat:
+          type: array
+          items: { $ref: "#/components/schemas/ChatMessage" }
+        people:
+          type: array
+          items:
+            type: object
+            properties:
+              personId: { type: string }
+              faceIndex: { type: integer }
+        unknownFaces: { type: integer }
+        faceScannedAt: { type: number }
+    EntryPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Entry" }
+        nextCursor:
+          type: string
+          nullable: true
+    AnalyzeResult:
+      type: object
+      properties:
+        opener: { type: string }
+        imageDescription: { type: string }
+        mood: { type: string }
+    Person:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        relation: { type: string }
+        isUser: { type: boolean }
+        templateCount: { type: integer }
+        enrolledFrom:
+          type: array
+          items: { $ref: "#/components/schemas/FaceRef" }
+    FaceRef:
+      type: object
+      required: [entryId, faceIndex]
+      properties:
+        entryId: { type: string }
+        faceIndex: { type: integer, minimum: 0, maximum: 19 }
+security:
+  - bearerAuth: []

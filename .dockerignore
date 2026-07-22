@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+client/dist
+server/cache
+server/data
+data
+.env
+Dockerfile
+docker-compose.yml
+# not needed inside the image
+.git
+android
+docs
+*.md
+.claude
+.vscode
+.idea

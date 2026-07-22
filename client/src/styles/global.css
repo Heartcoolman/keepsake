@@ -1,0 +1,1701 @@
+:root {
+  --fg: rgba(255, 255, 255, 0.92);
+  --fg-dim: rgba(255, 255, 255, 0.55);
+  --fg-faint: rgba(255, 255, 255, 0.32);
+  --panel: rgba(22, 22, 26, 0.6);
+  --serif: 'Noto Serif SC', 'Songti SC', 'STSong', serif;
+  --sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+.account-password,
+.account-manager {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  margin-top: 18px;
+}
+
+.account-password input,
+.account-create input,
+.account-create select,
+.account-row input,
+.account-row select {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.22);
+  color: inherit;
+  padding: 9px 10px;
+}
+
+.account-list {
+  max-height: 210px;
+  overflow: auto;
+}
+
+.account-row,
+.account-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* minmax(0, …) lets the inputs shrink so the nowrap 禁用 label never forces
+   horizontal overflow */
+.account-row { grid-template-columns: minmax(100px, 1fr) minmax(0, 1fr) minmax(0, 1.3fr) auto auto auto; text-align: left; }
+
+.account-row label { white-space: nowrap; }
+
+.account-row small { display: block; color: rgba(255, 255, 255, 0.52); }
+.account-create { grid-template-columns: 1fr 1fr; }
+
+@media (max-width: 760px) {
+  .account-row,
+  .account-create { grid-template-columns: 1fr; }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: radial-gradient(120% 100% at 50% 42%, #0c0a07 0%, #060605 55%, #000 100%);
+  color: var(--fg);
+  font-family: var(--sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+body.no-cursor,
+body.no-cursor * {
+  cursor: none !important;
+}
+
+/* keep a text caret affordance in fields even while the custom ring hides the pointer */
+body.no-cursor input,
+body.no-cursor textarea {
+  cursor: text !important;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+input {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  outline: none;
+}
+
+/* visible focus ring for keyboard users (kept off mouse focus via :focus-visible) */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.75);
+  outline-offset: 2px;
+}
+
+/* sits above the entry photo (z 0) so the sand-burst splashes over it, below all UI (z 10+) */
+.particle-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.particle-canvas--disabled {
+  display: none;
+}
+
+.cursor-ring {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 999;
+  mix-blend-mode: difference;
+}
+
+/* ---------- shared bits ---------- */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(8px);
+  font-size: 16px;
+  color: var(--fg-dim);
+  transition: color 0.2s, background 0.2s;
+}
+
+.icon-btn:hover {
+  color: var(--fg);
+  background: rgba(40, 40, 46, 0.7);
+}
+
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 22px;
+  border-radius: 999px;
+  background: rgba(28, 28, 33, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  font-size: 14px;
+  transition: background 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+.pill-btn:hover {
+  background: rgba(48, 48, 55, 0.8);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.toast {
+  position: fixed;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 10px 20px;
+  border-radius: 999px;
+  background: rgba(30, 30, 35, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 13px;
+  z-index: 300;
+  animation: fade-up 0.3s ease both;
+}
+
+.toast.error {
+  color: #ffb4b4;
+  border-color: rgba(255, 120, 120, 0.4);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---------- timeline ---------- */
+
+.timeline {
+  position: relative;
+  z-index: 10;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 20px;
+  z-index: 20;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 230px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(24, 24, 28, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.search-box input {
+  width: 100%;
+  font-size: 13px;
+}
+
+.search-box input::placeholder {
+  color: var(--fg-faint);
+}
+
+.search-icon {
+  color: var(--fg-faint);
+  font-size: 15px;
+}
+
+.chips {
+  display: flex;
+  gap: 8px;
+}
+
+.chip {
+  padding: 7px 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  background: rgba(24, 24, 28, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  color: var(--fg);
+}
+
+.chip--active {
+  color: #111;
+  background: rgba(255, 255, 255, 0.92);
+  border-color: transparent;
+}
+
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.carousel {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 5vw;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  padding: 0 50vw;
+  scrollbar-width: none;
+}
+
+.carousel::-webkit-scrollbar {
+  display: none;
+}
+
+.tcard {
+  flex: none;
+  height: 52vh;
+  scroll-snap-align: center;
+  border-radius: 10px;
+  overflow: hidden;
+  transform: scale(0.9);
+  opacity: 0.55;
+  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.45s, box-shadow 0.45s;
+  box-shadow: 0 12px 60px rgba(0, 0, 0, 0.55);
+}
+
+.tcard img {
+  height: 100%;
+  width: auto;
+  max-width: 72vw;
+  object-fit: cover;
+  display: block;
+}
+
+.tcard--focus {
+  transform: scale(1);
+  opacity: 1;
+  box-shadow: 0 18px 80px rgba(0, 0, 0, 0.7), 0 0 42px rgba(255, 220, 170, 0.05);
+}
+
+.add-card {
+  width: 26vh;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.add-card-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: var(--fg-faint);
+  font-size: 13px;
+}
+
+.add-plus {
+  font-size: 30px;
+  font-weight: 200;
+}
+
+.carousel-footer {
+  position: absolute;
+  bottom: 26px;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  z-index: 20;
+  pointer-events: none;
+  animation: fade-in 0.4s ease both;
+}
+
+.carousel-footer .pill-btn,
+.carousel-footer .icon-btn {
+  pointer-events: auto;
+}
+
+.card-title {
+  font-size: 14px;
+  color: var(--fg-dim);
+  letter-spacing: 0.08em;
+}
+
+.card-page {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  letter-spacing: 0.2em;
+}
+
+.footer-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.del-btn {
+  color: var(--fg-dim);
+}
+
+.del-btn--armed {
+  color: #ff9d9d;
+  border-color: rgba(255, 120, 120, 0.35);
+}
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: var(--fg-dim);
+  font-size: 14px;
+  z-index: 10;
+}
+
+.empty-star {
+  font-size: 26px;
+  color: rgba(255, 220, 170, 0.65);
+  animation: twinkle 2.4s ease-in-out infinite;
+}
+
+@keyframes twinkle {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.empty-state .pill-btn {
+  margin-top: 14px;
+}
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  border: 2px dashed rgba(255, 255, 255, 0.25);
+  font-size: 18px;
+  letter-spacing: 0.15em;
+  color: var(--fg);
+  pointer-events: none;
+}
+
+/* ---------- session ---------- */
+
+.session {
+  position: relative;
+  z-index: 10;
+  height: 100%;
+}
+
+.back-btn {
+  position: fixed;
+  top: 18px;
+  left: 18px;
+  z-index: 40;
+}
+
+.subtitle-toggle {
+  position: fixed;
+  top: 22px;
+  right: 22px;
+  z-index: 40;
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: rgba(24, 24, 28, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  backdrop-filter: blur(8px);
+  transition: color 0.2s;
+}
+
+.subtitle-toggle:hover {
+  color: var(--fg-dim);
+}
+
+.tab-bar {
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(24, 24, 28, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(10px);
+}
+
+.tab {
+  padding: 7px 22px;
+  border-radius: 999px;
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  color: var(--fg-faint);
+  transition: all 0.25s;
+}
+
+.tab--active {
+  color: #111;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.analyzing-hint {
+  position: fixed;
+  bottom: 120px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  font-size: 13.5px;
+  color: var(--fg-dim);
+  letter-spacing: 0.1em;
+  animation: shimmer-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes shimmer-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.95;
+  }
+}
+
+.orbit-hint {
+  position: fixed;
+  bottom: 30px;
+  left: 24px;
+  z-index: 30;
+  font-size: 11.5px;
+  letter-spacing: 0.12em;
+  color: var(--fg-faint);
+  pointer-events: none;
+  animation: hint-fade 6s ease forwards;
+}
+
+@keyframes hint-fade {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.condensing-text {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 30;
+  font-family: var(--serif);
+  font-size: 15px;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: var(--fg-dim);
+  animation: shimmer-pulse 2.2s ease-in-out infinite;
+}
+
+/* chat overlay */
+
+.chat-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  pointer-events: none;
+  animation: fade-in 0.5s ease both;
+}
+
+/* condensing: messages sink away softly instead of vanishing.
+   Must be an animation — the base fade-in with fill:both pins opacity at 1,
+   which outranks any plain opacity declaration. */
+.chat-overlay--fading {
+  animation: chat-fade-out 0.9s ease both;
+}
+
+@keyframes chat-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+/* entry transition: the real photo dissolves into the sand-bursting particles.
+   img height tracks the camera dolly (83vh at radius 1.45 → 70.2vh at 1.72). */
+.photo-dissolve {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  animation: photo-dissolve-in 0.45s ease both;
+}
+
+/* FLIP zoom from the card rect (WAAPI drives the transform) — no fade-in */
+.photo-dissolve--flip {
+  animation: none;
+  opacity: 1;
+}
+
+.photo-dissolve--out {
+  animation: none;
+  opacity: 0;
+  transition: opacity 0.9s ease;
+}
+
+.photo-dissolve img {
+  height: 83vh;
+  max-width: 88vw;
+  object-fit: cover;
+  border-radius: 12px;
+  transition: height 2.4s cubic-bezier(0.65, 0, 0.35, 1);
+  -webkit-mask-image: radial-gradient(ellipse 72% 72% at center, #000 52%, transparent 96%);
+  mask-image: radial-gradient(ellipse 72% 72% at center, #000 52%, transparent 96%);
+}
+
+.photo-dissolve--shrink img {
+  height: 70.2vh;
+}
+
+@keyframes photo-dissolve-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.92;
+  }
+}
+
+/* the column itself is click-through — only bubbles catch the pointer, so the
+   wheel zooms the photo on empty space but scrolls the chat when over text */
+.chat-scroll {
+  pointer-events: none;
+  max-width: 980px;
+  height: 100%;
+  margin: 0 auto;
+  padding: 90px 28px 150px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  scrollbar-width: none;
+  mask-image: linear-gradient(to bottom, transparent 0, black 110px, black 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 110px, black 100%);
+}
+
+.chat-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.chat-scroll::before {
+  content: '';
+  flex: 1 0 auto;
+}
+
+.msg {
+  max-width: 46%;
+  font-size: 14.5px;
+  line-height: 1.75;
+  animation: fade-up-msg 0.45s ease both;
+  user-select: text;
+  pointer-events: auto;
+}
+
+@keyframes fade-up-msg {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.msg-ai {
+  align-self: flex-start;
+  color: var(--fg);
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.9), 0 0 24px rgba(0, 0, 0, 0.7);
+}
+
+.msg-user {
+  align-self: flex-end;
+  padding: 9px 16px;
+  border-radius: 14px;
+  background: rgba(24, 26, 32, 0.66);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  backdrop-filter: blur(8px);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.typing-dots {
+  letter-spacing: 0.2em;
+  animation: shimmer-pulse 1.2s ease-in-out infinite;
+}
+
+/* voice / keyboard input */
+
+.voice-area {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.voice-row,
+.keyboard-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.voice-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 230px;
+  height: 46px;
+  padding: 0 24px;
+  border-radius: 999px;
+  background: rgba(26, 26, 31, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  font-size: 13.5px;
+  color: var(--fg-dim);
+  touch-action: none;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+
+.voice-pill:hover {
+  color: var(--fg);
+}
+
+.voice-pill--rec {
+  background: rgba(38, 38, 45, 0.9);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.voice-wave {
+  width: 200px;
+  height: 30px;
+}
+
+.voice-tip {
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: rgba(20, 20, 24, 0.85);
+  font-size: 11.5px;
+  color: var(--fg-dim);
+  animation: fade-in 0.2s ease both;
+}
+
+.voice-tip--cancel {
+  color: rgba(255, 150, 140, 0.9);
+}
+
+.interim-pill {
+  position: fixed;
+  bottom: 92px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  max-width: 70vw;
+  padding: 10px 20px;
+  border-radius: 999px;
+  background: rgba(24, 24, 30, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  font-size: 13.5px;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: fade-up 0.25s ease both;
+}
+
+.interim-mic {
+  opacity: 0.7;
+  margin-right: 4px;
+}
+
+.chat-input {
+  width: min(420px, 56vw);
+  height: 46px;
+  padding: 0 20px;
+  border-radius: 999px;
+  background: rgba(26, 26, 31, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(10px);
+  font-size: 14px;
+}
+
+.chat-input::placeholder {
+  color: var(--fg-faint);
+}
+
+.send-btn {
+  height: 46px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #111;
+  font-size: 13.5px;
+  transition: opacity 0.2s;
+}
+
+.send-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.condense-btn {
+  position: fixed;
+  right: 24px;
+  bottom: 92px;
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 11px 24px;
+  border-radius: 999px;
+  background: rgba(30, 29, 26, 0.8);
+  border: 1px solid rgba(255, 224, 178, 0.28);
+  backdrop-filter: blur(10px);
+  font-size: 13.5px;
+  color: rgba(255, 234, 200, 0.95);
+  box-shadow: 0 0 24px rgba(255, 210, 150, 0.08);
+  animation: fade-up 0.4s ease both;
+  transition: box-shadow 0.3s, border-color 0.3s;
+}
+
+.condense-btn:hover {
+  border-color: rgba(255, 224, 178, 0.55);
+  box-shadow: 0 0 36px rgba(255, 210, 150, 0.18);
+}
+
+/* diary */
+
+.diary-view {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  overflow-y: auto;
+  scrollbar-width: none;
+  /* scrim: diary text reads over the particle photo, whose bright regions
+     otherwise wash out the white serif text */
+  background: rgba(0, 0, 0, 0.35);
+  animation: fade-in 0.8s ease both;
+}
+
+.diary-view::-webkit-scrollbar {
+  display: none;
+}
+
+.diary-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 96px 32px 120px;
+  font-family: var(--serif);
+}
+
+.diary-title {
+  text-align: center;
+  font-size: 34px;
+  font-weight: 500;
+  letter-spacing: 0.35em;
+  text-indent: 0.35em;
+  color: rgba(255, 255, 255, 0.95);
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.9);
+}
+
+.diary-date {
+  margin-top: 18px;
+  text-align: center;
+  font-size: 12.5px;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: var(--fg-dim);
+}
+
+.memory-date--btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6em;
+  margin-left: auto;
+  margin-right: auto;
+  padding: 4px 10px;
+  letter-spacing: inherit;
+  text-indent: 0;
+  color: inherit;
+  font: inherit;
+  opacity: 0.92;
+  border-radius: 999px;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.memory-date--btn:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.memory-date-hint {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-indent: 0;
+  opacity: 0.45;
+}
+
+.memory-date--editing {
+  display: flex;
+  justify-content: center;
+}
+
+.memory-date-input {
+  font: inherit;
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  color: var(--fg);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 8px;
+  padding: 4px 8px;
+  color-scheme: dark;
+}
+
+.session-memory-date {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  font-size: 12px;
+  letter-spacing: 0.28em;
+  color: var(--fg-dim);
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.75);
+}
+
+.session .tab-bar ~ .session-memory-date {
+  top: 58px;
+}
+
+.diary-body {
+  margin-top: 52px;
+  font-size: 16.5px;
+  line-height: 2.3;
+  color: rgba(255, 255, 255, 0.9);
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.85);
+  user-select: text;
+}
+
+.diary-body p {
+  text-indent: 2em;
+  margin-bottom: 1.6em;
+  animation: fade-up-msg 0.9s ease both;
+}
+
+.diary-title-input,
+.diary-body-input {
+  display: block;
+  width: 100%;
+  font: inherit;
+  font-family: var(--serif);
+  color: inherit;
+  letter-spacing: inherit;
+  background: rgba(18, 18, 24, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  outline: none;
+  padding: 12px 16px;
+}
+
+.diary-title-input {
+  font-size: 34px;
+  font-weight: 500;
+  text-align: center;
+}
+
+.diary-body-input {
+  font-size: 16.5px;
+  line-height: 2.1;
+  resize: vertical;
+}
+
+.diary-edit-actions {
+  margin-top: 40px;
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+
+.diary-edit-btn {
+  opacity: 0.55;
+}
+
+.diary-edit-btn:hover {
+  opacity: 1;
+}
+
+/* ---------- review overlay (monthly look-back) ---------- */
+
+.review-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 250;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 8, 12, 0.62);
+  backdrop-filter: blur(10px);
+  animation: fade-in 0.25s ease both;
+}
+
+.review-panel {
+  position: relative;
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 30px 34px 34px;
+  border-radius: 18px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.review-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 32px;
+  height: 32px;
+  font-size: 13px;
+}
+
+.review-month-nav {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+}
+
+.review-month-nav .icon-btn:disabled {
+  opacity: 0.25;
+  pointer-events: none;
+}
+
+.review-month-label {
+  font-size: 16px;
+  letter-spacing: 0.2em;
+}
+
+.review-text-area {
+  margin-top: 24px;
+  padding-top: 22px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: center;
+}
+
+.review-heading {
+  font-size: 13px;
+  letter-spacing: 0.3em;
+  color: var(--fg-dim);
+}
+
+.review-body {
+  margin-top: 18px;
+  text-align: left;
+  font-family: var(--serif);
+  font-size: 15.5px;
+  line-height: 2.1;
+  color: rgba(255, 255, 255, 0.9);
+  user-select: text;
+}
+
+.review-body p {
+  text-indent: 2em;
+  margin-bottom: 1.2em;
+}
+
+.review-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 14px;
+}
+
+.review-stamp {
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+
+.review-regen {
+  font-size: 12px;
+  color: var(--fg-dim);
+  opacity: 0.55;
+  transition: opacity 0.2s;
+}
+
+.review-regen:hover {
+  opacity: 1;
+}
+
+.review-cta {
+  margin-top: 16px;
+}
+
+.review-hint {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--fg-faint);
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 720px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .search-box {
+    width: 100%;
+    order: 2;
+  }
+
+  .topbar-right {
+    margin-left: 0;
+  }
+
+  .msg {
+    max-width: 72%;
+  }
+
+  .tcard {
+    height: 44vh;
+  }
+
+  .diary-title {
+    font-size: 26px;
+  }
+
+  .diary-inner {
+    padding: 84px 22px 110px;
+  }
+
+  .review-panel {
+    padding: 24px 16px 26px;
+  }
+
+  .voice-area {
+    right: 14px;
+    left: 14px;
+    align-items: stretch;
+  }
+
+  .voice-pill {
+    flex: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01s !important;
+    transition-duration: 0.01s !important;
+  }
+}
+
+/* ---------- user picker & people registry ---------- */
+
+.user-panel {
+  position: relative;
+  width: min(460px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 30px 34px 34px;
+  border-radius: 18px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  text-align: center;
+}
+
+.user-panel--accounts {
+  width: min(720px, 92vw);
+}
+
+.user-heading {
+  font-size: 16px;
+  letter-spacing: 0.15em;
+}
+
+.user-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.user-grid {
+  margin-top: 22px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+}
+
+.user-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 96px;
+  padding: 14px 8px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  color: var(--fg);
+  font-size: 13px;
+  transition: transform 0.15s, border-color 0.15s;
+}
+
+.user-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.user-card--active {
+  border-color: rgba(255, 255, 255, 0.45);
+}
+
+.user-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.user-form {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.user-form input,
+.people-row--edit input {
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+.people-empty {
+  margin-top: 18px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+}
+
+.people-list {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  text-align: left;
+}
+
+.people-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.people-row .user-avatar {
+  width: 36px;
+  height: 36px;
+  font-size: 15px;
+  flex: none;
+}
+
+.people-row--edit input {
+  min-width: 0;
+  flex: 1;
+}
+
+.people-name {
+  font-size: 14px;
+}
+
+.people-relation {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
+.people-badge {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: var(--fg-dim);
+  flex: none;
+}
+
+.people-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+
+.people-del--armed {
+  color: #e08484;
+}
+
+.people-add {
+  align-self: center;
+  margin-top: 6px;
+}
+
+.people-tabs {
+  position: static;
+  transform: none;
+  margin: 14px auto 0;
+  justify-content: center;
+}
+
+.user-avatar img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.people-faces {
+  display: flex;
+  gap: 4px;
+  margin-left: 6px;
+}
+
+.people-faces img {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  object-fit: cover;
+  opacity: 0.85;
+}
+
+.people-faces--big img {
+  width: 44px;
+  height: 44px;
+}
+
+.people-more {
+  align-self: center;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+.people-cluster {
+  flex-wrap: wrap;
+}
+
+.people-merge-hint .chip {
+  margin-left: 6px;
+}
+
+.people-row--target {
+  cursor: pointer;
+  border: 1px dashed rgba(255, 255, 255, 0.25);
+}
+
+.people-row--target:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ---------- relationship graph ---------- */
+
+.user-panel--graph {
+  width: min(920px, 96vw);
+  max-height: 90vh;
+}
+
+.graph-canvas {
+  margin-top: 16px;
+  width: 100%;
+  height: 62vh;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.graph-canvas svg {
+  animation: graph-fade 0.6s ease;
+}
+
+@keyframes graph-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+.graph-node {
+  cursor: grab;
+  transition: opacity 0.35s ease;
+}
+
+.graph-node .user-avatar {
+  transition: transform 0.25s ease;
+}
+
+.graph-node:hover .user-avatar {
+  transform: scale(1.12);
+}
+
+.graph-node--dim {
+  opacity: 0.25;
+}
+
+.graph-edge {
+  stroke: rgba(255, 255, 255, 0.25);
+  stroke-width: 1.2;
+}
+
+.graph-edge--cooccur {
+  stroke-dasharray: 3 3;
+  stroke: rgba(255, 255, 255, 0.12);
+}
+
+.graph-edge-group {
+  transition: opacity 0.35s ease;
+}
+
+.graph-edge--dim {
+  opacity: 0.2;
+}
+
+.graph-edge-label,
+.graph-node-label {
+  font-size: 10.5px;
+  fill: var(--fg-dim);
+  text-anchor: middle;
+}
+
+.graph-side-panel {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  text-align: left;
+}
+
+.graph-side-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ---------- unknown-face chips in a session ---------- */
+
+.face-chips {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  animation: fade-in 0.4s ease both;
+}
+
+/* the subtitle toggle owns the top-right corner while chatting — slide below it */
+.session:has(.subtitle-toggle) .face-chips {
+  top: 68px;
+  right: 22px;
+}
+
+.face-chips-hint {
+  font-size: 12px;
+  color: var(--fg-dim);
+  letter-spacing: 0.1em;
+}
+
+.face-chip-wrap {
+  position: relative;
+}
+
+.face-chip {
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 1.5px dashed rgba(255, 255, 255, 0.45);
+  background: none;
+  cursor: pointer;
+  transition: transform 0.15s, border-color 0.15s;
+}
+
+.face-chip:hover {
+  transform: scale(1.08);
+  border-color: rgba(255, 255, 255, 0.8);
+}
+
+.face-chip--active {
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.9);
+}
+
+.face-chip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.face-pop {
+  position: absolute;
+  top: 54px;
+  right: 0;
+  width: 240px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--panel);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  animation: fade-in 0.2s ease both;
+}
+
+.face-namer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.face-namer-existing {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.face-namer-new {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.face-namer-new input {
+  padding: 8px 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* ---------- profile: 念念眼中的你 ---------- */
+
+.profile-panel {
+  width: min(560px, 92vw);
+  text-align: left;
+}
+
+.profile-panel .user-heading,
+.profile-panel > .people-empty {
+  text-align: center;
+}
+
+.profile-link {
+  margin-top: 18px;
+}
+
+.profile-section {
+  margin-top: 22px;
+}
+
+.profile-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  letter-spacing: 0.15em;
+  color: var(--fg-dim);
+}
+
+.profile-mood {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+
+.profile-edit {
+  margin-left: auto;
+  opacity: 0.55;
+}
+
+.profile-edit:hover {
+  opacity: 1;
+}
+
+.profile-personality {
+  margin-top: 10px;
+  font-size: 13.5px;
+  line-height: 1.8;
+  color: var(--fg);
+}
+
+.profile-edit-area {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.profile-edit-area textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.7;
+  resize: vertical;
+}
+
+.profile-edit-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.memory-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.memory-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 13px;
+}
+
+.memory-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.memory-date {
+  font-size: 11px;
+  color: var(--fg-faint);
+  flex: none;
+}
+
+.memory-row--edit input {
+  flex: 1;
+  padding: 8px 11px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--fg);
+  font-size: 13px;
+}

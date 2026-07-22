@@ -1,0 +1,12 @@
+{
+  "name": "nianxiang",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm --filter @nianxiang/server test",
+    "start": "node --env-file-if-exists=.env server/src/index.ts"
+  }
+}

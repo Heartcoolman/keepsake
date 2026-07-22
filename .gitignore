@@ -1,0 +1,27 @@
+node_modules/
+dist/
+.pnpm-store/
+.env
+.env.local
+.DS_Store
+android/local.properties
+android/.gradle/
+android/**/build/
+android/app/build/
+*.apk
+*.aab
+# Apple: project is generated from apple/project.yml by xcodegen
+apple/Nianxiang.xcodeproj/
+apple/dd/
+apple/build/
+*.xcuserdatad/
+xcuserdata/
+# Runtime data & inference caches: contain private diaries, password hashes,
+# face biometric templates. Never commit — keep only under the server's data dir.
+server/data/
+server/cache/
+# ONNX models (~208MB): auto-downloaded on first start, bundled into the Docker image.
+server/models/
+# Local AI-tool configs — never part of the public tree.
+.claude/
+.cursor/

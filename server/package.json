@@ -1,0 +1,22 @@
+{
+  "name": "@nianxiang/server",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=../.env --watch src/index.ts",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "hono": "^4.7.0",
+    "onnxruntime-node": "^1.27.0",
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.0"
+  }
+}

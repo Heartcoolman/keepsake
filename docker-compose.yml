@@ -1,0 +1,26 @@
+services:
+  nianxiang:
+    build: .
+    container_name: nianxiang
+    ports:
+      - "${PORT:-8787}:${PORT:-8787}"
+    environment:
+      - PORT=${PORT:-8787}
+      - MOCK_AI=${MOCK_AI:-0}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - AI_BASE_URL=${AI_BASE_URL:-}
+      - AI_MODEL=${AI_MODEL:-}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN:-}
+      - REGISTRATION_CODE=${REGISTRATION_CODE:-}
+      - OPS_BOOTSTRAP_TOKEN=${OPS_BOOTSTRAP_TOKEN:-}
+      - TRUST_PROXY=${TRUST_PROXY:-0}
+      - NODE_ENV=production
+    volumes:
+      # persist per-photo caches and all data (entries/monthly/people/users) across rebuilds;
+      # inference models are bundled in the image so first startup works offline.
+      # NOTE: the container runs as the non-root `node` user (uid 1000); on Linux
+      # hosts make sure ./data is writable by uid 1000 (e.g. chown -R 1000:1000 ./data).
+      - ./data/cache:/app/server/cache
+      - ./data:/app/server/data
+    restart: unless-stopped
