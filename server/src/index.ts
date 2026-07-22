@@ -1,3 +1,4 @@
+import { license } from './licenseBoot.ts';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
@@ -128,5 +129,6 @@ startKeyringSweep();
 startDeferredTasks();
 
 serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log(`nianxiang server on :${info.port}${MOCK ? ' (MOCK_AI)' : ''} (api v1 at /api/v1)`);
+  const licensed = license ? ` [licensed to ${license.licensee}]` : ' [unlicensed demo]';
+  console.log(`nianxiang server on :${info.port}${MOCK ? ' (MOCK_AI)' : ''}${licensed} (api v1 at /api/v1)`);
 });

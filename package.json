@@ -1,7 +1,7 @@
 {
   "name": "nianxiang",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "Elastic-2.0",
   "scripts": {
     "dev": "pnpm --parallel -r dev",
     "build": "pnpm -r build",

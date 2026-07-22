@@ -7,6 +7,7 @@ services:
     environment:
       - PORT=${PORT:-8787}
       - MOCK_AI=${MOCK_AI:-0}
+      - NIANXIANG_LICENSE=${NIANXIANG_LICENSE:-}
       - XAI_API_KEY=${XAI_API_KEY:-}
       - AI_BASE_URL=${AI_BASE_URL:-}
       - AI_MODEL=${AI_MODEL:-}

@@ -1,7 +1,7 @@
 {
   "name": "@nianxiang/server",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "Elastic-2.0",
   "type": "module",
   "scripts": {
     "dev": "node --env-file-if-exists=../.env --watch src/index.ts",

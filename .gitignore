@@ -22,6 +22,8 @@ server/data/
 server/cache/
 # ONNX models (~208MB): auto-downloaded on first start, bundled into the Docker image.
 server/models/
+# Per-deployment license token — issued individually, never committed.
+nianxiang.license
 # Local AI-tool configs — never part of the public tree.
 .claude/
 .cursor/

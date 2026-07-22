@@ -4,7 +4,7 @@
 
 **把日常照片变成粒子星云，和「念念」聊聊照片背后的故事，凝聚成一篇属于你的日记。**
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-Elastic--2.0-blue)](LICENSE)
 ![Server](https://img.shields.io/badge/server-Node%20%2B%20Hono-339933?logo=nodedotjs&logoColor=white)
 ![Web](https://img.shields.io/badge/web-React%2019%20%2B%20Three.js-61DAFB?logo=react&logoColor=black)
 ![Android](https://img.shields.io/badge/android-Compose%20%2B%20GLES%203.1-3DDC84?logo=android&logoColor=white)
@@ -85,7 +85,7 @@ docker compose up --build
 
 ## 半开源说明
 
-本仓库是「念想」的**公开部分**，以 Apache-2.0 发布，克隆即可独立构建运行。产品的差异化核心放在私有子模块 `core/`（keepsake-core）中，公开构建以桩实现优雅降级：
+本仓库是「念想」的**公开部分**，以 [Elastic License 2.0](LICENSE)（source-available）发布，克隆即可独立构建、以演示模式运行。产品的差异化核心放在私有子模块 `core/`（keepsake-core）中，公开构建以桩实现优雅降级：
 
 | 模块 | 状态 | 公开构建下的行为 |
 |---|---|---|
@@ -105,6 +105,12 @@ pnpm install && pnpm dev    # 完整功能
 ```
 
 修改核心代码后 `./scripts/select-core.sh --push` 回写并到 `core/` 提交；`--reset` 还原公开桩。推送公开仓库前请跑 `./scripts/check-leaks.sh`。
+
+## 授权
+
+任何部署都需要授权令牌才能解锁完整功能。服务端启动时按以下顺序查找令牌：环境变量 `NIANXIANG_LICENSE`（令牌内容）→ `NIANXIANG_LICENSE_FILE`（文件路径）→ 工作目录或其上级的 `nianxiang.license` 文件。未提供或校验失败时服务端**降级为演示模式**（等效 `MOCK_AI=1` + `INFERENCE_DISABLED=1`），全部交互仍可跑通但 AI 与推理为占位实现。
+
+获取授权请联系作者。按 [Elastic License 2.0](LICENSE) 条款，禁止移动、修改、禁用或绕过授权校验功能。
 
 ## API
 
@@ -147,4 +153,4 @@ xcodebuild -project Nianxiang.xcodeproj -scheme Nianxiang -destination 'platform
 
 ## License
 
-代码以 [Apache-2.0](LICENSE) 发布；第三方模型许可见 [NOTICE](NOTICE)。`core/` 私有子模块保留所有权利。
+代码以 [Elastic License 2.0](LICENSE)（source-available）发布：可自由查阅、修改、自托管，但不得作为托管服务对第三方提供，不得绕过授权校验功能。第三方模型许可见 [NOTICE](NOTICE)。`core/` 私有子模块保留所有权利。

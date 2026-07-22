@@ -1,8 +1,10 @@
 nianxiang（念想）
 Copyright 2026 Heartcoolman
 
-本仓库代码以 Apache License 2.0 发布（见 LICENSE）。以下第三方模型许可与本仓库
-代码许可无关，请自托管者务必知悉：
+本仓库代码以 Elastic License 2.0 发布（见 LICENSE）：源码可查阅、修改、自托管，
+但不得作为托管服务对第三方提供，不得绕过授权校验（license key）功能。完整功能
+需要授权令牌，未授权部署以演示模式运行。以下第三方模型许可与本仓库代码许可
+无关，请自托管者务必知悉：
 
 1. 人脸识别模型权重（InsightFace buffalo_l：det_10g.onnx / w600k_r50.onnx）
    - 不随本仓库分发；服务端在启用人脸功能时于首次启动从 HuggingFace 自动下载。
