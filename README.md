@@ -13,9 +13,8 @@
 
 </div>
 
-<!-- TODO: 演示 GIF/截图 —— 用 MOCK_AI=1 pnpm dev 录制,无需任何 API key
-<p align="center"><img src="docs/assets/demo.gif" width="720" alt="粒子星云演示" /></p>
--->
+<p align="center"><img src="docs/assets/demo.gif" width="720" alt="演示:照片化作粒子星云,与念念对话后凝聚成日记" /></p>
+<p align="center"><sub>实录演示:MOCK_AI=1 离线模式 + 合成示例照片 —— 打开照片 → 沙化成粒子星云(景深分层) → 与念念对话 → 凝聚成日记</sub></p>
 
 ---
 
