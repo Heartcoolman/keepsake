@@ -4,6 +4,9 @@ import { recordUsage } from './usage.ts';
 
 const BASE_URL = (process.env.AI_BASE_URL || 'https://api.x.ai/v1').replace(/\/+$/, '');
 export const MODEL = process.env.AI_MODEL || 'grok-4.5';
+// Kimi K-series pins temperature at 1.0 (explicit values are rejected) and always
+// reasons before answering; low effort keeps interactive latency acceptable.
+const IS_KIMI = MODEL.startsWith('kimi');
 
 /** Rough prompt-size estimate for streaming calls (no usage object available). */
 function estimateTokens(body: Record<string, unknown>): number {
@@ -28,10 +31,15 @@ export async function xaiChat(
   const signals: AbortSignal[] = [];
   if (requestSignal) signals.push(requestSignal);
   if (body.stream !== true) signals.push(AbortSignal.timeout(120_000));
+  const payload: Record<string, unknown> = { model: MODEL, ...body };
+  if (IS_KIMI) {
+    delete payload.temperature;
+    payload.reasoning_effort ??= 'low';
+  }
   const res = await fetch(`${BASE_URL}/chat/completions`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ model: MODEL, ...body }),
+    body: JSON.stringify(payload),
     signal: signals.length ? AbortSignal.any(signals) : undefined,
   });
   if (meterId && res.ok) {
