@@ -16,7 +16,11 @@ services:
       - REGISTRATION_CODE=${REGISTRATION_CODE:-}
       - OPS_BOOTSTRAP_TOKEN=${OPS_BOOTSTRAP_TOKEN:-}
       - TRUST_PROXY=${TRUST_PROXY:-0}
+      # optional host-side DA3 depth sidecar (OpenVINO iGPU); empty = local DA2 fallback
+      - DEPTH_SIDECAR_URL=${DEPTH_SIDECAR_URL:-}
       - NODE_ENV=production
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # persist per-photo caches and all data (entries/monthly/people/users) across rebuilds;
       # inference models are bundled in the image so first startup works offline.
