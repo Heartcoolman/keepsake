@@ -257,7 +257,7 @@ aiRoutes.post('/entries/:id/chat', aiBodyLimit, async (c) => {
   const data = await memory.getUserData(userId, keys.udk);
   const profile = {
     personality: data.profile.personality.slice(0, 300),
-    memories: data.memories.slice(-8).map((m) => m.text),
+    memories: data.memories.slice(-8).map((m) => `${ymd(m.createdAt)}记:${m.text}`),
     mood: data.profile.mood,
   };
   const me = await people.getPerson(userId, keys.scopeKey).catch(() => undefined);
@@ -271,7 +271,14 @@ aiRoutes.post('/entries/:id/chat', aiBodyLimit, async (c) => {
       messages: [
         {
           role: 'system',
-          content: chatPrompt(String(imageDescription ?? ''), scene, profile, selfName, !!photo),
+          content: chatPrompt(
+            String(imageDescription ?? ''),
+            scene,
+            profile,
+            selfName,
+            !!photo,
+            entry.takenAt,
+          ),
         },
         ...(photo ? [photo] : []),
         ...trimHistory(messages),
