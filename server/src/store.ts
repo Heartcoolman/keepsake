@@ -30,6 +30,8 @@ export interface ChatMessage {
 export interface PersonRef {
   personId: string;
   faceIndex: number;
+  /** normalized face-box center x (0..1, display orientation); absent on pre-existing scans */
+  cx?: number;
 }
 
 export type DateSource = 'exif' | 'filename' | 'file' | 'now' | 'manual' | 'chat';

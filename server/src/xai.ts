@@ -8,10 +8,20 @@ export const MODEL = process.env.AI_MODEL || 'grok-4.5';
 // reasons before answering; low effort keeps interactive latency acceptable.
 const IS_KIMI = MODEL.startsWith('kimi');
 
-/** Rough prompt-size estimate for streaming calls (no usage object available). */
+/** Rough prompt-size estimate for streaming calls (no usage object available).
+ *  Inline images are dropped from the count — base64 length wildly overstates
+ *  their token cost; flat-rate them instead. */
 function estimateTokens(body: Record<string, unknown>): number {
   try {
-    return Math.ceil(JSON.stringify(body.messages ?? '').length / 4);
+    let images = 0;
+    const s = JSON.stringify(body.messages ?? '', (_k, v: unknown) => {
+      if (typeof v === 'string' && v.startsWith('data:')) {
+        images++;
+        return '';
+      }
+      return v;
+    });
+    return Math.ceil(s.length / 4) + images * 1024;
   } catch {
     return 0;
   }

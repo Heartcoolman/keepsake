@@ -7,6 +7,7 @@ import {
   diaryPrompt,
   monthlyPrompt,
   peopleLine,
+  positionLabels,
   type PeopleCtx,
 } from '../prompts.ts';
 import { analyzeCacheKey, hashImage, readAnalyzeCache, writeAnalyzeCache } from '../analyzeCache.ts';
@@ -33,7 +34,7 @@ aiRoutes.use('/entries/:id/diary', userRateLimit(30), requireAiEntitlement);
 aiRoutes.use('/monthly/:yearMonth/generate', userRateLimit(10), requireAiEntitlement);
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string };
-type ScenePerson = { name: string; relation: string; isSelf: boolean };
+type ScenePerson = { name: string; relation: string; isSelf: boolean; pos?: string };
 
 /** Non-empty array of object elements — guards trimHistory's m.role/m.content access. */
 function validMessages(messages: unknown): messages is ChatMessage[] {
@@ -83,12 +84,33 @@ async function resolveScenePeople(
   if (!entry.people?.length) return [];
   const registry = await people.listPeople(keys.scopeId, keys.scopeKey);
   const out: ScenePerson[] = [];
+  const cxs: { cx?: number }[] = [];
   for (const r of entry.people.slice(0, 10)) {
     const p = registry.find((x) => x.id === r.personId);
     if (!p?.name) continue;
     out.push({ name: p.name, relation: people.relationFor(p, userId), isSelf: p.id === userId });
+    cxs.push({ cx: r.cx });
   }
+  positionLabels(cxs).forEach((pos, i) => {
+    if (pos) out[i]!.pos = pos;
+  });
   return out;
+}
+
+/** The photo as a user message for multimodal chat; undefined when the blob is unavailable. */
+async function photoMessage(
+  entryId: string,
+  udk: Buffer,
+): Promise<Record<string, unknown> | undefined> {
+  const buf = await store.readEntryBlob(entryId, 'img', udk).catch(() => null);
+  if (!buf) return undefined;
+  return {
+    role: 'user',
+    content: [
+      { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${buf.toString('base64')}` } },
+      { type: 'text', text: '(这是我们正在聊的这张照片)' },
+    ],
+  };
 }
 
 const ymd = (ts: number): string => {
@@ -119,10 +141,15 @@ aiRoutes.post('/entries/:id/analyze', async (c) => {
     const refreshed = await store.getEntry(entry.id);
     if (refreshed) {
       const registry = await people.listPeople(keys.scopeId, keys.scopeKey);
-      const known = refreshed.people
-        .map((r) => registry.find((p) => p.id === r.personId))
-        .filter((p): p is people.Person => !!p)
-        .map((p) => ({ name: p.name, relation: people.relationFor(p, refreshed.ownerId || refreshed.userId) }));
+      const pairs = refreshed.people
+        .map((r) => ({ r, p: registry.find((p) => p.id === r.personId) }))
+        .filter((x): x is { r: store.PersonRef; p: people.Person } => !!x.p);
+      const labels = positionLabels(pairs.map((x) => ({ cx: x.r.cx })));
+      const known = pairs.map((x, i) => ({
+        name: x.p.name,
+        relation: people.relationFor(x.p, refreshed.ownerId || refreshed.userId),
+        ...(labels[i] ? { pos: labels[i] } : {}),
+      }));
       peopleCtx = { known, unknownCount: refreshed.unknownFaces };
     }
   } catch (e) {
@@ -237,14 +264,16 @@ aiRoutes.post('/entries/:id/chat', aiBodyLimit, async (c) => {
   const selfName = me?.name ?? c.get('account').displayName;
   const scene = await resolveScenePeople(entry, userId, keys);
   const imageDescription = entry.imageDescription;
+  const photo = await photoMessage(entry.id, keys.udk);
 
   const upstream = await xaiChat(
     {
       messages: [
         {
           role: 'system',
-          content: chatPrompt(String(imageDescription ?? ''), scene, profile, selfName),
+          content: chatPrompt(String(imageDescription ?? ''), scene, profile, selfName, !!photo),
         },
+        ...(photo ? [photo] : []),
         ...trimHistory(messages),
       ],
       stream: true,
