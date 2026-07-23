@@ -44,6 +44,7 @@ REPLACE=(
   "apple/Particle/Shaders.metal::apple/Nianxiang/Particle/Shaders.metal"
 )
 ADD=(
+  "server/matting.ts::server/src/matting.ts"
   "server/test/session-api.e2e.test.ts::server/test/session-api.e2e.test.ts"
   "server/test/relationships.e2e.test.ts::server/test/relationships.e2e.test.ts"
   "android/test/ParticleRendererTest.kt::android/app/src/androidTest/java/com/nianxiang/app/particle/ParticleRendererTest.kt"
