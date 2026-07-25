@@ -11,9 +11,26 @@ type Job<T> = {
 export type InferencePriority = 'interactive' | 'batch';
 
 const MAX_PENDING = 128;
+/** The queue runs strictly one job at a time, so a single wedged ONNX call would
+ *  otherwise stall every later job — interactive ones included — for the life of
+ *  the process. The timeout unblocks the queue; it cannot cancel the native call
+ *  already in flight, which may keep running in the background. */
+const JOB_TIMEOUT_MS = Number(process.env.INFERENCE_TIMEOUT_MS) || 120_000;
+
 const highQueue: Job<unknown>[] = [];
 const lowQueue: Job<unknown>[] = [];
 let draining = false;
+
+function withTimeout<T>(run: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`inference timed out after ${JOB_TIMEOUT_MS}ms`)),
+      JOB_TIMEOUT_MS,
+    );
+    timer.unref();
+    run().then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
 
 async function drain(): Promise<void> {
   if (draining) return;
@@ -22,7 +39,7 @@ async function drain(): Promise<void> {
     while (highQueue.length || lowQueue.length) {
       const job = (highQueue.length ? highQueue : lowQueue).shift()!;
       try {
-        job.resolve(await job.run());
+        job.resolve(await withTimeout(job.run));
       } catch (error) {
         job.reject(error);
       }

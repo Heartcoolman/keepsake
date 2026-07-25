@@ -306,13 +306,22 @@ export async function encryptPersonRecord(id: string, key: Buffer): Promise<bool
 }
 
 /** Re-encrypt every record in a scope under a new key (family-key rotation). */
+/** Re-key every person in a scope. Resumable by design: the destination key is
+ *  tried first, so a pass that died partway can simply be run again over the mix
+ *  of already-migrated and not-yet-migrated records instead of throwing on the
+ *  first one it already converted. */
 export async function reencryptScope(scopeId: string, oldKey: Buffer, newKey: Buffer): Promise<void> {
   for (const id of [...(await load()).values()].filter((p) => p.scopeId === scopeId).map((p) => p.id)) {
     await enqueue(id, async () => {
       const map = await load();
       const current = map.get(id);
       if (!current || current.scopeId !== scopeId) return;
-      const person = decryptStored(current, oldKey);
+      let person: Person;
+      try {
+        person = decryptStored(current, newKey);
+      } catch {
+        person = decryptStored(current, oldKey);
+      }
       const stored = toStored(person, newKey);
       await writeStoredAtomic(stored);
       map.set(id, stored);

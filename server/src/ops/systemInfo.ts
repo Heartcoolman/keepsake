@@ -120,18 +120,19 @@ export async function getSystemSnapshot(refresh = false): Promise<SystemSnapshot
 // ---------- backups ----------
 
 /** Per-file tolerant copy: entries vanishing mid-walk (atomic writers) are
- *  skipped, as are their .tmp/.bak transients and the backups dir itself. */
-async function copyTolerant(src: string, dest: string, skip: string): Promise<void> {
+ *  skipped, as are their .tmp/.bak transients and any skipped directories. */
+async function copyTolerant(src: string, dest: string, skip: string[]): Promise<void> {
   let entries;
   try {
     entries = await readdir(src, { withFileTypes: true });
   } catch {
     return;
   }
+  const skipResolved = skip.map((s) => resolve(s));
   await mkdir(dest, { recursive: true });
   for (const entry of entries) {
     const from = join(src, entry.name);
-    if (resolve(from) === resolve(skip)) continue;
+    if (skipResolved.includes(resolve(from))) continue;
     if (entry.isDirectory()) {
       await copyTolerant(from, join(dest, entry.name), skip);
       continue;
@@ -157,8 +158,11 @@ export async function createBackup(): Promise<BackupInfo> {
   const name = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
   const dest = BACKUP_DIR + name + '/';
   await mkdir(dest, { recursive: true });
-  await copyTolerant(DATA_DIR, dest + 'data/', BACKUP_DIR.slice(0, -1));
-  await copyTolerant(CACHE_DIR, dest + 'cache/', BACKUP_DIR.slice(0, -1));
+  // docker-compose mounts the host's ./data/cache at BOTH /app/server/cache and
+  // (via the ./data mount) /app/server/data/cache, so walking data/ would pull the
+  // whole inference cache in a second time on top of the explicit cache copy.
+  await copyTolerant(DATA_DIR, dest + 'data/', [BACKUP_DIR.slice(0, -1), DATA_DIR + 'cache']);
+  await copyTolerant(CACHE_DIR, dest + 'cache/', [BACKUP_DIR.slice(0, -1)]);
   const size = await walkSize(dest);
   cached = null; // disk numbers changed
   return { name, bytes: size.bytes, createdAt: d.getTime() };

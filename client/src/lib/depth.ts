@@ -16,7 +16,7 @@ export interface DepthLayers {
   height: number;
   /** cleaned depth, 255 = near */
   depth: Uint8Array;
-  /** 255 = foreground */
+  /** soft foreground alpha, 255 = fully subject; the in-between band is the matte's hair detail */
   mask: Uint8Array;
   /** inpainted background RGB (subject removed) */
   bg: Uint8Array;

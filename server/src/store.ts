@@ -186,10 +186,17 @@ export function sanitizeMeta(raw: Record<string, unknown>): EntryMeta {
       ? str(raw.clientUploadId)
       : '',
     people: Array.isArray(raw.people)
-      ? raw.people.slice(0, 20).map((p: { personId?: unknown; faceIndex?: unknown }) => ({
-          personId: str(p?.personId),
-          faceIndex: Math.max(0, Math.min(19, Number(p?.faceIndex) || 0)),
-        }))
+      ? raw.people.slice(0, 20).map((p: { personId?: unknown; faceIndex?: unknown; cx?: unknown }) => {
+          const ref: PersonRef = {
+            personId: str(p?.personId),
+            faceIndex: Math.max(0, Math.min(19, Number(p?.faceIndex) || 0)),
+          };
+          // cx drives the left/right position labels in prompts — dropping it here
+          // silently disables that grounding, since every write path passes through.
+          const cx = Number(p?.cx);
+          if (Number.isFinite(cx)) ref.cx = Math.min(1, Math.max(0, cx));
+          return ref;
+        })
       : [],
     unknownFaces: Math.max(0, Math.min(20, Math.floor(nonNegative(raw.unknownFaces)))),
     faceScannedAt: nonNegative(raw.faceScannedAt),

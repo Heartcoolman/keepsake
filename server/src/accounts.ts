@@ -3,10 +3,9 @@
  *  KEK = scrypt(password, kekSalt) wraps the UDK (personal data key) and the X25519
  *  private key; the family key arrives sealed to the public key (encFk). Recovery
  *  wraps duplicate UDK/priv under a KDF of the one-shot recovery code. */
-import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import { createKeyedQueue } from './lib/keyedQueue.ts';
 import { writeAtomic } from './lib/atomicFile.ts';
 import { signHS256, verifyHS256 } from './lib/jwt.ts';
@@ -16,18 +15,15 @@ import {
   generateX25519KeyPair,
   isEnvelope,
   isSealedBox,
+  kdfVersionOf,
   randomKey,
+  scryptWith,
   unwrapKey,
   wrapKey,
+  KDF_CURRENT,
   type Envelope,
   type SealedBox,
 } from './crypto.ts';
-
-const scryptAsync = promisify(scrypt) as (
-  password: string,
-  salt: Buffer,
-  keylen: number,
-) => Promise<Buffer>;
 
 export type AccountRole = 'admin' | 'member';
 export type AccountType = 'family' | 'personal';
@@ -54,10 +50,18 @@ export interface Account {
   encUdk: Envelope | null;
   pubKey: string | null;
   encPrivKey: Envelope | null;
+  /** scrypt profile the password wraps (encUdk/encPrivKey) were written with. */
+  kdfVersion: number;
   encFk: SealedBox | null;
+  /** Previous family-key grant, kept only while a rotation is in flight so a
+   *  crash mid-re-encryption still leaves both keys recoverable. */
+  encFkPrev: SealedBox | null;
   recoverySalt: string | null;
   encUdkRecovery: Envelope | null;
   encPrivKeyRecovery: Envelope | null;
+  /** scrypt profile the recovery wraps were written with — rotated independently
+   *  of the password wraps, so it needs its own field. */
+  recoveryKdfVersion: number;
   /** isUser person bundle sealed to pubKey after a removal-while-offline; converted
    *  back into the personal scope on next login. */
   pendingPerson: SealedBox | null;
@@ -133,24 +137,48 @@ export function validPassword(p: string): boolean {
   return typeof p === 'string' && p.length >= MIN_PASSWORD && p.length <= 128;
 }
 
-/** scrypt salt:hash, both base64url — async so hashing never blocks the event loop */
+/** `s<version>:salt:hash` (both base64url). The legacy two-field `salt:hash` form
+ *  predates versioning and always means profile 1 — parsing both is what lets the
+ *  cost be raised without locking existing accounts out. Async so hashing never
+ *  blocks the event loop. */
 export async function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(16);
-  const hash = await scryptAsync(password, salt, 64);
-  return `${salt.toString('base64url')}:${hash.toString('base64url')}`;
+  const hash = await scryptWith(password, salt, 64, KDF_CURRENT);
+  return `s${KDF_CURRENT}:${salt.toString('base64url')}:${hash.toString('base64url')}`;
+}
+
+/** Profile id + salt + expected hash from either stored form; null when malformed. */
+function parsePasswordHash(
+  stored: string,
+): { version: number; salt: Buffer; expected: Buffer } | null {
+  const parts = stored.split(':');
+  const versioned = parts.length === 3 && /^s\d+$/.test(parts[0]!);
+  if (parts.length !== 2 && !versioned) return null;
+  const [saltB64, hashB64] = versioned ? [parts[1]!, parts[2]!] : [parts[0]!, parts[1]!];
+  if (!saltB64 || !hashB64) return null;
+  return {
+    version: versioned ? kdfVersionOf(parts[0]!.slice(1)) : 1,
+    salt: Buffer.from(saltB64, 'base64url'),
+    expected: Buffer.from(hashB64, 'base64url'),
+  };
 }
 
 export async function verifyPassword(password: string, stored: string): Promise<boolean> {
-  const [saltB64, hashB64] = stored.split(':');
-  if (!saltB64 || !hashB64) return false;
+  const parsed = parsePasswordHash(stored);
+  if (!parsed) return false;
   try {
-    const salt = Buffer.from(saltB64, 'base64url');
-    const expected = Buffer.from(hashB64, 'base64url');
-    const actual = await scryptAsync(password, salt, expected.length);
-    return expected.length === actual.length && timingSafeEqual(expected, actual);
+    const actual = await scryptWith(password, parsed.salt, parsed.expected.length, parsed.version);
+    return parsed.expected.length === actual.length && timingSafeEqual(parsed.expected, actual);
   } catch {
     return false;
   }
+}
+
+/** True when this account still holds material written at an older scrypt cost.
+ *  Both the auth hash and the key wraps are checked — a login upgrades both. */
+export function needsKdfUpgrade(account: Account): boolean {
+  if (kdfVersionOf(parsePasswordHash(account.passwordHash)?.version) < KDF_CURRENT) return true;
+  return hasCrypto(account) && kdfVersionOf(account.kdfVersion) < KDF_CURRENT;
 }
 
 /** Scrypt hash of an unguessable value, verified against on login misses so an
@@ -195,10 +223,13 @@ function normalizeAccount(raw: unknown): Account | null {
     encUdk: envOrNull(v.encUdk),
     pubKey: strOrNull(v.pubKey),
     encPrivKey: envOrNull(v.encPrivKey),
+    kdfVersion: kdfVersionOf(v.kdfVersion),
     encFk: sealedOrNull(v.encFk),
+    encFkPrev: sealedOrNull(v.encFkPrev),
     recoverySalt: strOrNull(v.recoverySalt),
     encUdkRecovery: envOrNull(v.encUdkRecovery),
     encPrivKeyRecovery: envOrNull(v.encPrivKeyRecovery),
+    recoveryKdfVersion: kdfVersionOf(v.recoveryKdfVersion),
     pendingPerson: sealedOrNull(v.pendingPerson),
   };
 }
@@ -268,9 +299,11 @@ export interface CryptoFields {
   encUdk: Envelope;
   pubKey: string;
   encPrivKey: Envelope;
+  kdfVersion: number;
   recoverySalt: string;
   encUdkRecovery: Envelope;
   encPrivKeyRecovery: Envelope;
+  recoveryKdfVersion: number;
 }
 
 export interface ProvisionedKeys {
@@ -287,21 +320,23 @@ export async function provisionCrypto(
   existing?: { udk: Buffer; priv: Buffer; pub: Buffer },
 ): Promise<ProvisionedKeys> {
   const kekSalt = randomBytes(16);
-  const kek = await deriveKek(password, kekSalt);
+  const kek = await deriveKek(password, kekSalt, KDF_CURRENT);
   const udk = existing?.udk ?? randomKey();
   const { pub, priv } = existing ?? generateX25519KeyPair();
   const recoveryCode = generateRecoveryCode();
   const recoverySalt = randomBytes(16);
-  const rk = await deriveKek(recoveryCode.replaceAll('-', ''), recoverySalt);
+  const rk = await deriveKek(recoveryCode.replaceAll('-', ''), recoverySalt, KDF_CURRENT);
   return {
     fields: {
       kekSalt: kekSalt.toString('base64url'),
       encUdk: wrapKey(udk, kek),
       pubKey: pub.toString('base64url'),
       encPrivKey: wrapKey(priv, kek),
+      kdfVersion: KDF_CURRENT,
       recoverySalt: recoverySalt.toString('base64url'),
       encUdkRecovery: wrapKey(udk, rk),
       encPrivKeyRecovery: wrapKey(priv, rk),
+      recoveryKdfVersion: KDF_CURRENT,
     },
     udk,
     priv,
@@ -310,18 +345,19 @@ export async function provisionCrypto(
   };
 }
 
-/** Re-wrap existing keys under a new password (self password change). */
+/** Re-wrap existing keys under a new password (self password change, KDF upgrade). */
 export async function makePasswordWraps(
   password: string,
   udk: Buffer,
   priv: Buffer,
-): Promise<Pick<CryptoFields, 'kekSalt' | 'encUdk' | 'encPrivKey'>> {
+): Promise<Pick<CryptoFields, 'kekSalt' | 'encUdk' | 'encPrivKey' | 'kdfVersion'>> {
   const kekSalt = randomBytes(16);
-  const kek = await deriveKek(password, kekSalt);
+  const kek = await deriveKek(password, kekSalt, KDF_CURRENT);
   return {
     kekSalt: kekSalt.toString('base64url'),
     encUdk: wrapKey(udk, kek),
     encPrivKey: wrapKey(priv, kek),
+    kdfVersion: KDF_CURRENT,
   };
 }
 
@@ -330,20 +366,41 @@ export async function makeRecoveryFields(
   udk: Buffer,
   priv: Buffer,
 ): Promise<{
-  fields: Pick<CryptoFields, 'recoverySalt' | 'encUdkRecovery' | 'encPrivKeyRecovery'>;
+  fields: Pick<
+    CryptoFields,
+    'recoverySalt' | 'encUdkRecovery' | 'encPrivKeyRecovery' | 'recoveryKdfVersion'
+  >;
   recoveryCode: string;
 }> {
   const recoveryCode = generateRecoveryCode();
   const recoverySalt = randomBytes(16);
-  const rk = await deriveKek(recoveryCode.replaceAll('-', ''), recoverySalt);
+  const rk = await deriveKek(recoveryCode.replaceAll('-', ''), recoverySalt, KDF_CURRENT);
   return {
     fields: {
       recoverySalt: recoverySalt.toString('base64url'),
       encUdkRecovery: wrapKey(udk, rk),
       encPrivKeyRecovery: wrapKey(priv, rk),
+      recoveryKdfVersion: KDF_CURRENT,
     },
     recoveryCode,
   };
+}
+
+/** Fields that re-wrap everything this password protects at the current cost.
+ *  Applied on login/unlock so stored accounts drift forward without a migration
+ *  pass — the plaintext password is only ever available on those paths. */
+export async function makeKdfUpgrade(
+  password: string,
+  udk: Buffer,
+  priv: Buffer,
+): Promise<Pick<CryptoFields, 'kekSalt' | 'encUdk' | 'encPrivKey' | 'kdfVersion'> & {
+  passwordHash: string;
+}> {
+  const [wraps, passwordHash] = await Promise.all([
+    makePasswordWraps(password, udk, priv),
+    hashPassword(password),
+  ]);
+  return { ...wraps, passwordHash };
 }
 
 /** Unwrap UDK + private key with the account password. Null on wrong password/no crypto. */
@@ -353,7 +410,11 @@ export async function unlockKeys(
 ): Promise<{ udk: Buffer; priv: Buffer; pub: Buffer } | null> {
   if (!hasCrypto(account)) return null;
   try {
-    const kek = await deriveKek(password, Buffer.from(account.kekSalt!, 'base64url'));
+    const kek = await deriveKek(
+      password,
+      Buffer.from(account.kekSalt!, 'base64url'),
+      account.kdfVersion,
+    );
     return {
       udk: unwrapKey(account.encUdk!, kek),
       priv: unwrapKey(account.encPrivKey!, kek),
@@ -372,7 +433,11 @@ export async function unlockKeysWithRecovery(
   if (!account.recoverySalt || !account.encUdkRecovery || !account.encPrivKeyRecovery || !account.pubKey)
     return null;
   try {
-    const rk = await deriveKek(recoveryCode, Buffer.from(account.recoverySalt, 'base64url'));
+    const rk = await deriveKek(
+      recoveryCode,
+      Buffer.from(account.recoverySalt, 'base64url'),
+      account.recoveryKdfVersion,
+    );
     return {
       udk: unwrapKey(account.encUdkRecovery, rk),
       priv: unwrapKey(account.encPrivKeyRecovery, rk),
@@ -429,6 +494,7 @@ async function createAccountUnlocked(
     updatedAt: now,
     ...provisioned.fields,
     encFk: null,
+    encFkPrev: null,
     pendingPerson: null,
   };
   // ensure id not taken

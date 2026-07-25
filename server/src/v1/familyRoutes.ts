@@ -11,6 +11,7 @@ import * as relationships from '../relationships.ts';
 import * as store from '../store.ts';
 import * as keyring from '../keyring.ts';
 import { randomKey, sealToPub } from '../crypto.ts';
+import { rotateScopeCiphertext } from '../scopeRotation.ts';
 import { err } from './errors.ts';
 import { requireAuth, type AppEnv } from './middleware.ts';
 
@@ -350,27 +351,34 @@ async function removeMember(
   }));
   keyring.setFamily(target.id, null);
 
-  // 5. Rotate: new FK, re-encrypt everything in the scope, re-seal to the rest.
+  // 5. Rotate. Both keys are sealed onto every remaining member BEFORE any
+  //    ciphertext moves: the new key generated here only ever existed in a local
+  //    variable before, so any failure during re-encryption lost it for good and
+  //    permanently orphaned whatever had already been rewritten. With encFkPrev on
+  //    disk, an interrupted rotation is resumable (deferredTasks.resumeFkRotation)
+  //    and nothing becomes unreadable.
   const newFk = randomKey();
-  await people.reencryptScope(family.id, oldFk, newFk);
-  await relationships.reencryptScope(family.id, oldFk, newFk);
-  if (process.env.INFERENCE_DISABLED !== '1') {
-    const face = await import('../face.ts').catch(() => null);
-    if (face) await face.reencryptScopeCaches(family.id, oldFk, newFk);
-  }
-  for (const member of await accounts.listAccounts(family.id)) {
-    if (!member.pubKey) continue;
+  const remaining = (await accounts.listAccounts(family.id)).filter((m) => m.pubKey);
+  for (const member of remaining) {
     await accounts.updateAccount(member.id, (cur) => ({
       ...cur,
       encFk: sealToPub(Buffer.from(cur.pubKey!, 'base64url'), newFk),
+      encFkPrev: sealToPub(Buffer.from(cur.pubKey!, 'base64url'), oldFk),
       updatedAt: Date.now(),
     }));
+  }
+  keyring.putFamilyKey(family.id, newFk);
+
+  await rotateScopeCiphertext(family.id, oldFk, newFk);
+
+  // Rotation is complete — the fallback grant is no longer needed.
+  for (const member of remaining) {
+    await accounts.updateAccount(member.id, (cur) => ({ ...cur, encFkPrev: null, updatedAt: Date.now() }));
   }
   // Pending invites carry the old key — void them; the owner can re-invite.
   for (const invite of await families.listInvitesForFamily(family.id)) {
     await families.deleteInvite(invite.id);
   }
-  keyring.putFamilyKey(family.id, newFk);
   console.log(`[family] ${target.username} left ${family.id}; family key rotated`);
 }
 

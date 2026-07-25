@@ -276,13 +276,21 @@ export async function encryptRelationshipRecord(id: string, key: Buffer): Promis
 }
 
 /** Re-encrypt every record in a scope under a new key (family-key rotation). */
+/** Re-key every relationship in a scope. Destination key first so an interrupted
+ *  rotation can be resumed over records it already converted (see people.ts). */
 export async function reencryptScope(scopeId: string, oldKey: Buffer, newKey: Buffer): Promise<void> {
   for (const id of [...(await load()).values()].filter((r) => r.scopeId === scopeId).map((r) => r.id)) {
     await enqueue(id, async () => {
       const map = await load();
       const current = map.get(id);
       if (!current || current.scopeId !== scopeId) return;
-      const stored = toStored(decryptStored(current, oldKey), newKey);
+      let pair;
+      try {
+        pair = decryptStored(current, newKey);
+      } catch {
+        pair = decryptStored(current, oldKey);
+      }
+      const stored = toStored(pair, newKey);
       await writeStoredAtomic(stored);
       map.set(id, stored);
     });

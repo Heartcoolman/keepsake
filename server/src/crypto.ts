@@ -18,11 +18,53 @@ const scryptAsync = promisify(scrypt) as (
   password: string,
   salt: Buffer,
   keylen: number,
+  options: ScryptProfile,
 ) => Promise<Buffer>;
 
 export const KEY_LEN = 32;
 const IV_LEN = 12;
 const TAG_LEN = 16;
+
+// ---------- scrypt cost profiles ----------
+
+interface ScryptProfile {
+  N: number;
+  r: number;
+  p: number;
+  maxmem: number;
+}
+
+/** Profile 1 is Node's scrypt default — the parameters everything shipped with
+ *  before versioning existed. Profile 2 is the OWASP-recommended minimum
+ *  (N=2^17); it needs an explicit maxmem because 128*N*r exceeds Node's 32 MB cap.
+ *  Records carry their profile id, so old wraps keep opening while new material
+ *  is written at the current cost — that is what makes raising it possible at all. */
+const KDF_PROFILES: Record<number, ScryptProfile> = {
+  1: { N: 16_384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 },
+  2: { N: 131_072, r: 8, p: 1, maxmem: 192 * 1024 * 1024 },
+};
+
+/** Profile used for every newly written wrap or password hash. */
+export const KDF_CURRENT = 2;
+
+/** Coerce a stored value into a known profile id; anything unrecognized (absent
+ *  field on a pre-versioning record) means the original Node defaults. */
+export function kdfVersionOf(raw: unknown): number {
+  const v = Math.floor(Number(raw));
+  return Number.isFinite(v) && KDF_PROFILES[v] ? v : 1;
+}
+
+const profileFor = (version: number): ScryptProfile => KDF_PROFILES[kdfVersionOf(version)]!;
+
+/** scrypt with an explicit profile — the one entry point for every KDF call. */
+export function scryptWith(
+  password: string,
+  salt: Buffer,
+  keylen: number,
+  version: number,
+): Promise<Buffer> {
+  return scryptAsync(password, salt, keylen, profileFor(version));
+}
 
 /** Versioned AES-256-GCM envelope for JSON fields and wrapped keys. */
 export interface Envelope {
@@ -51,9 +93,10 @@ export function randomKey(len = KEY_LEN): Buffer {
   return randomBytes(len);
 }
 
-/** KEK from a password. The salt must be distinct from the auth-hash salt. */
-export function deriveKek(password: string, salt: Buffer): Promise<Buffer> {
-  return scryptAsync(password, salt, KEY_LEN);
+/** KEK from a password. The salt must be distinct from the auth-hash salt, and
+ *  `version` must be the profile the wrap was created with. */
+export function deriveKek(password: string, salt: Buffer, version = KDF_CURRENT): Promise<Buffer> {
+  return scryptWith(password, salt, KEY_LEN, version);
 }
 
 function gcmEncrypt(plain: Buffer, key: Buffer): Envelope {
@@ -181,7 +224,10 @@ export function generateRecoveryCode(): string {
   return out.slice(0, 32).replace(/(.{4})(?=.)/g, '$1-');
 }
 
-/** Normalize user input: uppercase, drop separators. */
+/** Normalize user input: uppercase, then drop everything outside the alphabet.
+ *  The character class must mirror RECOVERY_ALPHABET exactly — the previous
+ *  `[^A-Z2-9]` kept I and O, which the alphabet deliberately excludes, so those
+ *  glyphs survived into the KDF input instead of being treated as separators. */
 export function normalizeRecoveryCode(code: string): string {
-  return code.toUpperCase().replace(/[^A-Z2-9]/g, '');
+  return code.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g, '');
 }

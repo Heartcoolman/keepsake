@@ -25,14 +25,37 @@ export const authRoutes = new Hono<AppEnv>();
 const REFRESH_COOKIE = 'nx_refresh';
 const REFRESH_COOKIE_PATH = '/api/v1/auth';
 
+/** A TLS-terminating reverse proxy hands us plain HTTP, so with TRUST_PROXY unset
+ *  the refresh cookie silently loses its Secure flag on exactly the deployment
+ *  shape the docs recommend. COOKIE_SECURE forces the answer for deployments that
+ *  know they are behind TLS; otherwise we detect it, and warnIfProxyUntrusted
+ *  makes the misconfiguration loud rather than silent. */
 function isSecureRequest(c: Context): boolean {
+  const forced = process.env.COOKIE_SECURE?.trim();
+  if (forced === '1') return true;
+  if (forced === '0') return false;
   const proto = forwardedHeader(c, 'x-forwarded-proto');
   if (proto) return proto === 'https';
+  warnIfProxyUntrusted(c);
   try {
     return new URL(c.req.url).protocol === 'https:';
   } catch {
     return false;
   }
+}
+
+let proxyWarned = false;
+
+/** One-shot warning: a forwarded-proto header is present but TRUST_PROXY does not
+ *  let us read it, which is the exact condition that strips Secure off the cookie. */
+function warnIfProxyUntrusted(c: Context): void {
+  if (proxyWarned || !c.req.header('x-forwarded-proto')) return;
+  proxyWarned = true;
+  console.warn(
+    '[auth] WARNING: a reverse proxy is sending X-Forwarded-Proto but TRUST_PROXY is 0, ' +
+      'so it is ignored and the refresh cookie is being issued without the Secure flag. ' +
+      'Set TRUST_PROXY to the number of proxy hops (usually 1), or COOKIE_SECURE=1.',
+  );
 }
 
 /** Constant-time string compare so a mismatch's timing can't leak a secret's prefix. */
@@ -101,22 +124,31 @@ async function resolveFamilyKey(
 ): Promise<Buffer | undefined> {
   const familyId = account.familyId;
   if (!familyId) return undefined;
+
+  let granted: Buffer | undefined;
   if (account.encFk) {
     try {
-      return openSealed(account.encFk, keys.priv, keys.pub);
+      granted = openSealed(account.encFk, keys.priv, keys.pub);
     } catch (e) {
       console.warn('[auth] family key grant unreadable for', account.username, e);
     }
   }
+
+  // The live keyring wins over the stored grant. A rotation that failed to
+  // re-seal to every member leaves stale grants behind, and returning one of
+  // those would push the superseded key back into the keyring for everyone.
   const live = keyring.getFamilyKey(familyId);
   if (live) {
-    await accounts.updateAccount(account.id, (cur) => ({
-      ...cur,
-      encFk: sealToPub(keys.pub, live),
-      updatedAt: Date.now(),
-    }));
+    if (!granted?.equals(live)) {
+      await accounts.updateAccount(account.id, (cur) => ({
+        ...cur,
+        encFk: sealToPub(keys.pub, live),
+        updatedAt: Date.now(),
+      }));
+    }
     return live;
   }
+  if (granted) return granted;
   let creation = fkCreation.get(familyId);
   if (!creation) {
     creation = (async () => {
@@ -135,6 +167,32 @@ async function resolveFamilyKey(
     void creation.finally(() => fkCreation.delete(familyId));
   }
   return creation;
+}
+
+/** Transparent scrypt-cost upgrade. Accounts written under an older KDF profile
+ *  get their auth hash and key wraps rewritten on any path that holds the
+ *  plaintext password — login, unlock. Sessions stay valid; only stored material
+ *  changes, so raising the cost never needs an offline migration. */
+async function upgradeKdfIfNeeded(
+  account: accounts.Account,
+  password: string,
+  keys: { udk: Buffer; priv: Buffer },
+): Promise<accounts.Account> {
+  if (!accounts.needsKdfUpgrade(account)) return account;
+  try {
+    const fields = await accounts.makeKdfUpgrade(password, keys.udk, keys.priv);
+    const updated = await accounts.updateAccount(account.id, (cur) => ({
+      ...cur,
+      ...fields,
+      updatedAt: Date.now(),
+    }));
+    if (updated) console.log(`[auth] upgraded key derivation cost for ${updated.username}`);
+    return updated ?? account;
+  } catch (e) {
+    // A failed upgrade must never block the login it piggybacks on.
+    console.warn('[auth] kdf upgrade failed for', account.username, e);
+    return account;
+  }
 }
 
 /** Install keys into the keyring and fire the deferred catchup. */
@@ -343,7 +401,9 @@ authRoutes.post('/auth/bootstrap', ipRateLimit(10), async (c) => {
 // ---------- session ----------
 
 authRoutes.post('/auth/login', ipRateLimit(20), async (c) => {
-  const body = await c.req.json<{ username?: unknown; password?: unknown }>();
+  const body = await c.req
+    .json<{ username?: unknown; password?: unknown }>()
+    .catch(() => ({} as Record<string, unknown>));
   const username = typeof body.username === 'string' ? body.username.trim() : '';
   const password = typeof body.password === 'string' ? body.password : '';
   if (!username || !password) return err(c, 'VALIDATION', 'username and password required');
@@ -371,6 +431,7 @@ authRoutes.post('/auth/login', ipRateLimit(20), async (c) => {
 
   const keys = await accounts.unlockKeys(account, password);
   if (keys) {
+    account = await upgradeKdfIfNeeded(account, password, keys);
     const fk = await resolveFamilyKey(account, keys);
     account = (await accounts.getAccount(account.id)) ?? account;
     if (account.familyId && fk) await ensureUserPerson(account, account.familyId, fk);
@@ -408,6 +469,7 @@ authRoutes.post('/auth/unlock', requireAuth, ipRateLimit(20), async (c) => {
   }
   const keys = await accounts.unlockKeys(account, password);
   if (!keys) return err(c, 'INTERNAL', 'key material unreadable');
+  account = await upgradeKdfIfNeeded(account, password, keys);
   const fk = await resolveFamilyKey(account, keys);
   account = (await accounts.getAccount(account.id)) ?? account;
   installKeys(account, keys, fk);
@@ -456,7 +518,9 @@ authRoutes.get('/auth/me', requireAuth, async (c) => {
 
 authRoutes.patch('/auth/me/password', requireAuth, async (c) => {
   const account = c.get('account');
-  const body = await c.req.json<{ currentPassword?: unknown; newPassword?: unknown }>();
+  const body = await c.req
+    .json<{ currentPassword?: unknown; newPassword?: unknown }>()
+    .catch(() => ({} as Record<string, unknown>));
   const current = typeof body.currentPassword === 'string' ? body.currentPassword : '';
   const next = typeof body.newPassword === 'string' ? body.newPassword : '';
   if (!(await accounts.verifyPassword(current, account.passwordHash)))

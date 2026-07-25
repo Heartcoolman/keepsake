@@ -49,6 +49,10 @@ ADD=(
   "server/test/relationships.e2e.test.ts::server/test/relationships.e2e.test.ts"
   "android/test/ParticleRendererTest.kt::android/app/src/androidTest/java/com/nianxiang/app/particle/ParticleRendererTest.kt"
   "android/test/ParticleGestureUiTest.kt::android/app/src/androidTest/java/com/nianxiang/app/ui/ParticleGestureUiTest.kt"
+  # JVM 单测:断言的是私有粒子算法的配额/步长,和实现一起留在 core。公开树没有这两个
+  # 文件,所以公开 clone 的 ./gradlew test 只跑真正公开的测试,不会引用桩里不存在的符号。
+  "android/test/unit/ParticleModelsTest.kt::android/app/src/test/java/com/nianxiang/app/particle/ParticleModelsTest.kt"
+  "android/test/unit/ParticleRendererTest.kt::android/app/src/test/java/com/nianxiang/app/particle/ParticleRendererTest.kt"
   "apple/test/ParticleSamplerTests.swift::apple/NianxiangTests/ParticleSamplerTests.swift"
 )
 
@@ -65,13 +69,25 @@ case "$mode" in
       cp "$CORE/$src" "$ROOT/$dst"
       git -C "$ROOT" update-index --skip-worktree "$dst"
     done
+    # 托管块每次重写。旧实现只在标记不存在时追加一次,于是 ADD 名单新增的条目在
+    # 已经跑过一次脚本的机器上永远不会进 exclude —— 那些文件会以 untracked 出现在
+    # git status,`git add -A` 就把私有实现提交进公开仓了。
     EXCLUDE="$ROOT/.git/info/exclude"
-    MARK="# select-core.sh managed"
-    if ! grep -qF "$MARK" "$EXCLUDE" 2>/dev/null; then
-      { echo "$MARK"
-        for pair in "${ADD[@]}"; do echo "${pair##*::}"; done
-      } >> "$EXCLUDE"
-    fi
+    BEGIN="# >>> select-core.sh managed >>>"
+    END="# <<< select-core.sh managed <<<"
+    DROP="$ROOT/.git/info/.select-core-drop"
+    mkdir -p "$(dirname "$EXCLUDE")"
+    touch "$EXCLUDE"
+    { echo "$BEGIN"; echo "$END"; echo "# select-core.sh managed"  # 含旧格式裸标记
+      for pair in "${ADD[@]}"; do echo "${pair##*::}"; done
+    } > "$DROP"
+    grep -vxF -f "$DROP" "$EXCLUDE" > "$EXCLUDE.tmp" || true
+    mv "$EXCLUDE.tmp" "$EXCLUDE"
+    rm -f "$DROP"
+    { echo "$BEGIN"
+      for pair in "${ADD[@]}"; do echo "${pair##*::}"; done
+      echo "$END"
+    } >> "$EXCLUDE"
     for pair in "${ADD[@]}"; do
       src="${pair%%::*}"; dst="${pair##*::}"
       mkdir -p "$ROOT/$(dirname "$dst")"

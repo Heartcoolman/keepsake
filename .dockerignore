@@ -10,8 +10,16 @@ docker-compose.yml
 # not needed inside the image
 .git
 android
+apple
+core
 docs
+scripts
 *.md
 .claude
 .vscode
 .idea
+# model training / evaluation working dirs — tens of GB; keep them out of the
+# build context entirely or `docker build` stalls shipping them to the daemon
+da3-eval
+matting-eval
+parsing-data

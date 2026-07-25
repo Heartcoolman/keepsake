@@ -6,13 +6,36 @@
 export const INTERJECTION_RATE = 0.25;
 
 export interface PeopleCtx {
-  known: { name: string; relation: string }[];
+  known: { name: string; relation: string; pos?: string }[];
   unknownCount: number;
 }
 
-/** "妈妈(王芳)、李明" — relation first when present, bare name otherwise */
-export function peopleLine(known: { name: string; relation: string }[]): string {
-  return known.map((p) => (p.relation ? `${p.relation}(${p.name})` : p.name)).join('、');
+/** "左边:妈妈(王芳)、右边:李明" — position first when known, relation next, bare name otherwise */
+export function peopleLine(known: { name: string; relation: string; pos?: string }[]): string {
+  return known
+    .map((p) => `${p.pos ? `${p.pos}:` : ''}${p.relation ? `${p.relation}(${p.name})` : p.name}`)
+    .join('、');
+}
+
+/** Left-to-right labels from face-box centers; only meaningful with ≥2 located faces.
+ *  Plain geometry, so the public build gets the real thing — only the wording it
+ *  feeds into lives in the private core. */
+export function positionLabels(refs: { cx?: number }[]): (string | undefined)[] {
+  const located = refs
+    .map((r, i) => ({ i, cx: r.cx }))
+    .filter((e): e is { i: number; cx: number } => typeof e.cx === 'number');
+  const labels = refs.map<string | undefined>(() => undefined);
+  if (located.length < 2) return labels;
+  located.sort((a, b) => a.cx - b.cx);
+  if (located.length === 2) {
+    labels[located[0]!.i] = '左边';
+    labels[located[1]!.i] = '右边';
+  } else {
+    located.forEach((e, rank) => {
+      labels[e.i] = `左起第${rank + 1}`;
+    });
+  }
+  return labels;
 }
 
 export function analyzePrompt(allowInterjection: boolean, people?: PeopleCtx): string {
@@ -38,6 +61,7 @@ export type ScenePerson = {
   name: string;
   relation: string;
   isSelf?: boolean;
+  pos?: string;
 };
 
 export function chatPrompt(
@@ -45,12 +69,16 @@ export function chatPrompt(
   people: ScenePerson[] = [],
   profile?: ProfileCtx,
   selfName = '',
+  hasImage = false,
+  takenAt?: number,
 ): string {
   void profile;
   void selfName;
   const peopleBlock = people.length ? `\n照片中的人:${peopleLine(people)}。` : '';
+  const photoBlock = hasImage ? '\n原照片已附在对话里,可以直接看,细节以照片为准。' : '';
+  const dateBlock = takenAt ? `\n照片拍摄于 ${new Date(takenAt).toISOString().slice(0, 10)}。` : '';
   return `你正在和用户聊一张 TA 分享的照片。照片参考描述:
-${imageDescription}${peopleBlock}
+${imageDescription}${peopleBlock}${photoBlock}${dateBlock}
 请用中文自然地回应,每次不超过 80 字。
 (完整人设与对话规则属于私有 core 模块,此为公开构建的格式占位实现。)`;
 }

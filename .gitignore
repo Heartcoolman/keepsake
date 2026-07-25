@@ -24,6 +24,12 @@ server/cache/
 server/models/
 # Per-deployment license token — issued individually, never committed.
 nianxiang.license
+# Model training / evaluation working dirs (tens of GB of datasets, checkpoints and
+# eval renders). Private research artifacts — never part of the public tree, and
+# large enough that a stray `git add -A` would wreck the repository.
+da3-eval/
+matting-eval/
+parsing-data/
 # Local AI-tool configs — never part of the public tree.
 .claude/
 .cursor/

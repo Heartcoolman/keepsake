@@ -13,6 +13,7 @@ import * as relationships from './relationships.ts';
 import * as memory from './memory.ts';
 import { migrateLegacyAnalyzeCaches } from './analyzeCache.ts';
 import { enqueueInference } from './inferenceQueue.ts';
+import { rotateScopeCiphertext } from './scopeRotation.ts';
 
 const INFERENCE_DISABLED = process.env.INFERENCE_DISABLED === '1';
 
@@ -38,6 +39,7 @@ export function startDeferredTasks(): void {
 
 async function runCatchup(event: keyring.UnlockEvent): Promise<void> {
   await convertPendingPerson(event);
+  await resumeFkRotation(event);
   if (event.fk && event.familyId) await grantFamilyKey(event.familyId, event.fk);
 
   const scopeKey = event.fk ?? event.udk;
@@ -69,6 +71,34 @@ async function convertPendingPerson(event: keyring.UnlockEvent): Promise<void> {
     console.log(`[deferred] restored personal person record for ${event.accountId}`);
   } catch (e) {
     console.warn('[deferred] pending person conversion failed:', e);
+  }
+}
+
+/** Finish a family-key rotation that died partway. `encFkPrev` exists only while
+ *  a rotation is in flight, so finding one at login means the previous attempt
+ *  never reached its cleanup — replay the (previous → current) pass, which is
+ *  idempotent, then drop the fallback grants. */
+async function resumeFkRotation(event: keyring.UnlockEvent): Promise<void> {
+  if (!event.familyId || !event.fk) return;
+  const account = await accounts.getAccount(event.accountId);
+  if (!account?.encFkPrev || !account.pubKey) return;
+  let previousFk: Buffer;
+  try {
+    previousFk = openSealed(account.encFkPrev, event.priv, Buffer.from(account.pubKey, 'base64url'));
+  } catch (e) {
+    console.warn('[deferred] previous family key unreadable — rotation cannot resume:', e);
+    return;
+  }
+  if (previousFk.equals(event.fk)) return;
+  console.log(`[deferred] resuming interrupted family key rotation for ${event.familyId}`);
+  await rotateScopeCiphertext(event.familyId, previousFk, event.fk);
+  for (const member of await accounts.listAccounts(event.familyId)) {
+    if (!member.encFkPrev) continue;
+    await accounts.updateAccount(member.id, (cur) => ({
+      ...cur,
+      encFkPrev: null,
+      updatedAt: Date.now(),
+    }));
   }
 }
 
