@@ -33,3 +33,5 @@ parsing-data/
 # Local AI-tool configs — never part of the public tree.
 .claude/
 .cursor/
+.ccpanes/
+CLAUDE.md

@@ -22,6 +22,9 @@ export interface DepthLayers {
   bg: Uint8Array;
   /** inpainted background depth */
   bgDepth: Uint8Array;
+  /** per-pixel semantic class (0 bg / 1 hair / 2 skin / 3 clothes / 4 accessory), already
+   *  gated to the matte's foreground. Absent on servers without the parsing model. */
+  parts?: Uint8Array;
 }
 
 export interface DepthResult {
@@ -49,6 +52,7 @@ async function serverDepth(entryId: string, signal?: AbortSignal): Promise<Depth
       mask?: string;
       bg?: string;
       bgDepth?: string;
+      parts?: string;
     };
     const depthU8 = fromB64(j.depth);
     const depth: DepthMap = {
@@ -67,6 +71,7 @@ async function serverDepth(entryId: string, signal?: AbortSignal): Promise<Depth
         mask: fromB64(j.mask),
         bg: fromB64(j.bg),
         bgDepth: fromB64(j.bgDepth),
+        ...(j.parts ? { parts: fromB64(j.parts) } : {}),
       },
     };
   } catch (e) {
