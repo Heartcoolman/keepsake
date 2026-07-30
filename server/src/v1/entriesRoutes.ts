@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import * as store from '../store.ts';
@@ -201,12 +202,19 @@ entriesRoutes.get('/entries/:id/depth', async (c) => {
   if (process.env.INFERENCE_DISABLED === '1') return err(c, 'UNAVAILABLE', 'depth unavailable');
   const udk = udkOf(c);
   const ownerId = c.get('account').id;
-  const headers = {
-    'content-type': 'application/json',
-    'cache-control': 'private, max-age=31536000, immutable',
-  };
   try {
     const depth = await import('../depth.ts');
+    // Derived data, not the photo — a model swap changes these bytes while imageHash
+    // stays put. So it is revalidated rather than frozen: the ETag folds in the depth
+    // pipeline's version, and clients holding a pre-swap copy refetch on their next open
+    // instead of being pinned to it for a year.
+    const etag = `"${createHash('sha256')
+      .update(`${loaded.entry.imageHash}:${depth.DEPTH_OUTPUT_VERSION}`)
+      .digest('hex')
+      .slice(0, 32)}"`;
+    const validators = { 'cache-control': 'private, no-cache', etag };
+    if (c.req.header('if-none-match') === etag) return c.body(null, 304, validators);
+    const headers = { 'content-type': 'application/json', ...validators };
     // Cache hit needs neither the decrypted photo nor the inference queue.
     const cached = await depth.readDepthCache(ownerId, loaded.entry.imageHash, udk);
     if (cached) return c.body(cached, 200, headers);
@@ -262,6 +270,15 @@ entriesRoutes.get('/entries/:id/faces/:idx/thumb', async (c) => {
   if (process.env.INFERENCE_DISABLED === '1') return err(c, 'UNAVAILABLE', 'face unavailable');
   try {
     const face = await import('../face.ts');
+    // Derived from the detector's bbox, so it is revalidated rather than frozen — see
+    // the depth route for the same reasoning. Keyed on the crop's own identity (entry,
+    // face index) plus the pipeline version.
+    const etag = `"${createHash('sha256')
+      .update(`${id}:${idx}:${face.FACE_THUMB_VERSION}`)
+      .digest('hex')
+      .slice(0, 32)}"`;
+    const validators = { 'cache-control': 'private, no-cache', etag };
+    if (c.req.header('if-none-match') === etag) return c.body(null, 304, validators);
     // owner's UDK only available when the caller owns the photo
     const ownerUdk = loaded.ok ? udkOf(c) : undefined;
     // Cache hits skip the queue; a miss runs ONNX detection, so it goes through
@@ -270,10 +287,7 @@ entriesRoutes.get('/entries/:id/faces/:idx/thumb', async (c) => {
       (await face.readFaceThumbCache(id, idx, scopeId, scopeKey)) ??
       (await enqueueInference(() => face.faceThumb(id, idx, scopeId, scopeKey, ownerUdk)));
     if (!buf) return err(c, 'NOT_FOUND', 'face thumb not found');
-    return c.body(new Uint8Array(buf), 200, {
-      'content-type': 'image/jpeg',
-      'cache-control': 'private, max-age=31536000, immutable',
-    });
+    return c.body(new Uint8Array(buf), 200, { 'content-type': 'image/jpeg', ...validators });
   } catch (e) {
     console.error('[v1] face thumb failed', e);
     return err(c, 'UNAVAILABLE', 'face unavailable');
