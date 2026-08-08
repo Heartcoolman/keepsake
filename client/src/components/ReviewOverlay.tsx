@@ -1,9 +1,10 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useDialog } from '../lib/useDialog';
 import { useEntriesStore } from '../lib/db';
 import { formatDate } from '../lib/types';
 import { useReviewStore } from '../store/useReviewStore';
 import { useUserStore } from '../store/useUserStore';
+import { AnnualBookOverlay } from './AnnualBookOverlay';
 
 export function ReviewOverlay() {
   const open = useReviewStore((s) => s.open);
@@ -18,6 +19,7 @@ export function ReviewOverlay() {
   const syncUser = useReviewStore((s) => s.syncUser);
   const entries = useEntriesStore((s) => s.entries);
   const uid = useUserStore((s) => s.activeUserId);
+  const [annualOpen, setAnnualOpen] = useState(false);
 
   useEffect(() => {
     if (open) syncUser(uid ?? '');
@@ -113,10 +115,16 @@ export function ReviewOverlay() {
           )}
         </div>
 
+        <button className="pill-btn annual-open" onClick={() => setAnnualOpen(true)}>
+          ✦ 年度回忆册
+        </button>
+
         <button className="icon-btn review-close" title="关闭" onClick={closeOverlay}>
           ✕
         </button>
       </div>
+
+      {annualOpen && <AnnualBookOverlay onClose={() => setAnnualOpen(false)} />}
     </div>
   );
 }

@@ -1,8 +1,10 @@
+import { useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { ChatOverlay } from './ChatOverlay';
 import { DiaryView } from './DiaryView';
 import { FaceChips } from './FaceChips';
 import { MemoryDate } from './MemoryDate';
+import { ShareCardOverlay } from './ShareCardOverlay';
 import { VoiceInput } from './VoiceInput';
 
 export function SessionView() {
@@ -11,11 +13,13 @@ export function SessionView() {
   const textHidden = useAppStore((s) => s.textHidden);
   const interimText = useAppStore((s) => s.interimText);
   const busy = useAppStore((s) => s.busy);
+  const entryId = useAppStore((s) => s.entryId);
   const hasUserMsg = useAppStore((s) => s.messages.some((m) => m.role === 'user'));
   const backToTimeline = useAppStore((s) => s.backToTimeline);
   const setSessionTab = useAppStore((s) => s.setSessionTab);
   const toggleTextHidden = useAppStore((s) => s.toggleTextHidden);
   const generateDiary = useAppStore((s) => s.generateDiary);
+  const [shareOpen, setShareOpen] = useState(false);
 
   const showDiaryUI = phase === 'revealing' || phase === 'done';
   const chatting = phase === 'chatting';
@@ -46,6 +50,16 @@ export function SessionView() {
             对话
           </button>
         </div>
+      )}
+
+      {showDiaryUI && entryId && (
+        <button className="share-btn" title="生成分享卡" onClick={() => setShareOpen(true)}>
+          ⤴ 分享
+        </button>
+      )}
+
+      {shareOpen && entryId && (
+        <ShareCardOverlay entryId={entryId} onClose={() => setShareOpen(false)} />
       )}
 
       {showSessionDate && <MemoryDate className="session-memory-date" />}

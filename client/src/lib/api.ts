@@ -2,6 +2,7 @@ import type { FaceRef, GraphResponse, PersonDTO } from './types';
 import {
   apiFetch,
   apiJson,
+  ApiError,
   errorFromResponse,
   isAuthSession,
   isAuthUser,
@@ -508,4 +509,70 @@ export function parseDiaryStream(raw: string): {
   const title = /标题[::]\s*(.+)/.exec(header)?.[1]?.trim() ?? '';
   const mood = /心情[::]\s*(.+)/.exec(header)?.[1]?.trim() ?? '';
   return { title, mood, body, headerDone: idx >= 0 };
+}
+
+// ---------- memory exports (share card / annual book) ----------
+
+/** Rendered share card for one memory — decrypted server-side, streamed as JPEG. */
+export async function fetchExportCard(entryId: string, signal?: AbortSignal): Promise<Blob> {
+  const res = await apiFetch(`/api/v1/exports/card/${entryId}`, { signal });
+  if (!res.ok) throw await errorFromResponse(res, 'export card failed');
+  return res.blob();
+}
+
+export interface AnnualProgress {
+  step: number;
+  total: number;
+  label: string;
+}
+
+/** Kick off annual-book generation and follow its SSE progress frames. Resolves with
+ *  the done frame; the PDF itself is fetched afterwards via fetchAnnualFile. */
+export async function generateAnnualBook(
+  year: number,
+  onProgress: (p: AnnualProgress) => void,
+  signal?: AbortSignal,
+): Promise<{ pages: number; bytes: number }> {
+  const res = await apiFetch('/api/v1/exports/annual', {
+    method: 'POST',
+    body: JSON.stringify({ year }),
+    signal,
+  });
+  if (!res.ok) throw await errorFromResponse(res, 'annual export failed');
+  if (!res.body) throw new Error('annual export failed: empty body');
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let done: { pages: number; bytes: number } | null = null;
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    let idx: number;
+    while ((idx = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 2);
+      if (!frame.startsWith('data: ')) continue;
+      let payload: { type?: string; code?: string; message?: string; pages?: number; bytes?: number; step?: number; total?: number; label?: string };
+      try {
+        payload = JSON.parse(frame.slice(6));
+      } catch {
+        continue;
+      }
+      if (payload.type === 'progress')
+        onProgress({ step: payload.step ?? 0, total: payload.total ?? 0, label: payload.label ?? '' });
+      else if (payload.type === 'done') done = { pages: payload.pages ?? 0, bytes: payload.bytes ?? 0 };
+      else if (payload.type === 'error')
+        throw new ApiError(`annual export failed: ${payload.message ?? ''}`, 500, payload.code);
+    }
+  }
+  if (!done) throw new Error('annual export ended without a result');
+  return done;
+}
+
+/** Download the finished annual book (kept server-side in RAM for a short window). */
+export async function fetchAnnualFile(year: number, signal?: AbortSignal): Promise<Blob> {
+  const res = await apiFetch(`/api/v1/exports/annual/${year}/file`, { signal });
+  if (!res.ok) throw await errorFromResponse(res, 'annual file failed');
+  return res.blob();
 }
