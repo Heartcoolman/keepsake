@@ -9,6 +9,7 @@ import { relationshipRoutes } from './relationshipRoutes.ts';
 import { profileRoutes } from './profileRoutes.ts';
 import { aiRoutes } from './aiRoutes.ts';
 import { sessionRoutes } from './sessionRoutes.ts';
+import { exportsRoutes } from './exportsRoutes.ts';
 import { requireAuth, type AppEnv } from './middleware.ts';
 import { err } from './errors.ts';
 
@@ -69,6 +70,7 @@ export function createV1Router(): Hono<AppEnv> {
   v1.route('/', profileRoutes);
   v1.route('/', sessionRoutes);
   v1.route('/', aiRoutes);
+  v1.route('/', exportsRoutes);
 
   v1.notFound((c) => err(c, 'NOT_FOUND', 'not found'));
 

@@ -72,10 +72,11 @@ case "$mode" in
     # 托管块每次重写。旧实现只在标记不存在时追加一次,于是 ADD 名单新增的条目在
     # 已经跑过一次脚本的机器上永远不会进 exclude —— 那些文件会以 untracked 出现在
     # git status,`git add -A` 就把私有实现提交进公开仓了。
-    EXCLUDE="$ROOT/.git/info/exclude"
+    # .git 在 linked worktree 下是文件不是目录,路径必须问 git 要
+    EXCLUDE="$(git -C "$ROOT" rev-parse --path-format=absolute --git-path info/exclude)"
     BEGIN="# >>> select-core.sh managed >>>"
     END="# <<< select-core.sh managed <<<"
-    DROP="$ROOT/.git/info/.select-core-drop"
+    DROP="$(dirname "$EXCLUDE")/.select-core-drop"
     mkdir -p "$(dirname "$EXCLUDE")"
     touch "$EXCLUDE"
     { echo "$BEGIN"; echo "$END"; echo "# select-core.sh managed"  # 含旧格式裸标记

@@ -28,6 +28,9 @@ export async function startServer(
   await mkdir(copiedServer, { recursive: true });
   await cp(resolve(SERVER_ROOT, 'src'), resolve(copiedServer, 'src'), { recursive: true });
   await cp(resolve(SERVER_ROOT, 'package.json'), resolve(copiedServer, 'package.json'));
+  // install-time assets (export fonts) — absent on CI, where font-dependent tests skip
+  await cp(resolve(SERVER_ROOT, 'assets'), resolve(copiedServer, 'assets'), { recursive: true })
+    .catch(() => {});
   await symlink(resolve(SERVER_ROOT, 'node_modules'), resolve(copiedServer, 'node_modules'), 'dir');
 
   const port = 21_000 + ((process.pid + portOffset * 137) % 18_000);

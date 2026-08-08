@@ -22,6 +22,8 @@ server/data/
 server/cache/
 # ONNX models (~208MB): auto-downloaded on first start, bundled into the Docker image.
 server/models/
+# CJK fonts for exports (~40MB, OFL): scripts/fetch-fonts.sh downloads them.
+server/assets/fonts/
 # Per-deployment license token — issued individually, never committed.
 nianxiang.license
 # Model training / evaluation working dirs (tens of GB of datasets, checkpoints and

@@ -11,8 +11,11 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
+    "@resvg/resvg-js": "^2.6.2",
     "hono": "^4.7.0",
     "onnxruntime-node": "^1.27.0",
+    "pdf-lib": "^1.17.1",
+    "satori": "^0.29.0",
     "sharp": "^0.35.3"
   },
   "devDependencies": {
