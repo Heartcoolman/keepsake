@@ -357,6 +357,11 @@ final class ApiClient: @unchecked Sendable {
         try await requestBytes(path: "/api/v1/entries/\(entryId)/media/\(kind)")
     }
 
+    /// 服务端排版好的分享卡 JPEG（解密内容只在内存里走一遭）
+    func exportCard(entryId: String) async throws -> Data {
+        try await requestBytes(path: "/api/v1/exports/card/\(entryId)")
+    }
+
     func depthJson(entryId: String) async throws -> String {
         let data = try await requestBytes(path: "/api/v1/entries/\(entryId)/depth")
         return String(data: data, encoding: .utf8) ?? ""

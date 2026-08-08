@@ -501,6 +501,9 @@ private struct DiaryView: View {
     @Environment(AppViewModel.self) private var model
     @State private var title = ""
     @State private var bodyText = ""
+    @State private var sharing = false
+    /// 卡片字节 + 写好的临时文件(ShareLink 要 URL,预览要字节)
+    @State private var shareCard: (data: Data, url: URL)?
 
     var body: some View {
         // 0x80 遮罩：日记直接叠在粒子照片上，亮部需要压暗保证白色宋体可读。
@@ -550,11 +553,14 @@ private struct DiaryView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.bottom, 18)
                         }
-                        NxPill(text: "编辑", action: {
-                            title = entry.title
-                            bodyText = entry.diaryText
-                            editing = true
-                        }, icon: "pencil")
+                        HStack(spacing: 10) {
+                            NxPill(text: sharing ? "生成中…" : "分享", action: fetchShareCard, enabled: !sharing, icon: "square.and.arrow.up")
+                            NxPill(text: "编辑", action: {
+                                title = entry.title
+                                bodyText = entry.diaryText
+                                editing = true
+                            }, icon: "pencil")
+                        }
                         .padding(.top, 18)
                     }
                 }
@@ -565,6 +571,52 @@ private struct DiaryView: View {
                 .padding(.bottom, 110)
             }
             .scrollIndicators(.hidden)
+
+            if let card = shareCard {
+                DialogScrim(dismiss: { shareCard = nil }) {
+                    VStack(spacing: 16) {
+                        BytesImage(data: card.data, contentMode: .fit)
+                            .frame(maxHeight: 460)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        HStack(spacing: 10) {
+                            ShareLink(item: card.url, preview: SharePreview("回忆分享卡")) {
+                                HStack(spacing: 7) {
+                                    Image(systemName: "square.and.arrow.up").font(.system(size: 12))
+                                    Text("发送").font(.system(size: 12.5))
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .frame(minHeight: 36)
+                                .foregroundStyle(NxColors.onPaper)
+                                .background(NxColors.paper, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            NxPill(text: "关闭", action: { shareCard = nil })
+                        }
+                    }
+                    .padding(18)
+                }
+            }
+        }
+    }
+
+    /// 拉服务端排版的分享卡,写进临时目录供 ShareLink 引用
+    private func fetchShareCard() {
+        guard !sharing else { return }
+        sharing = true
+        Task {
+            defer { sharing = false }
+            do {
+                let data = try await model.api.exportCard(entryId: entry.id)
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("keepsake-card-\(entry.id.prefix(8)).jpg")
+                try data.write(to: url, options: .atomic)
+                shareCard = (data, url)
+            } catch {
+                if let msg = friendlyError(error, fallback: "分享卡生成失败", overrides: ["UNAVAILABLE": "服务器缺少导出字体,请联系管理员"]) {
+                    model.toast = msg
+                }
+            }
         }
     }
 }

@@ -300,6 +300,9 @@ class ApiClient(private val session: SessionStore) {
 
     suspend fun getEntry(id: String): Entry = get("/api/v1/entries/$id")
 
+    /** 服务端排版好的分享卡 JPEG(解密内容只在内存里走一遭) */
+    suspend fun exportCard(entryId: String): ByteArray = getBytes("/api/v1/exports/card/$entryId")
+
     suspend fun uploadEntry(meta: Entry, jpeg: ByteArray, thumb: ByteArray, override: Boolean = false): Entry {
         suspend fun once() = client.post("${base()}/api/v1/entries") {
             auth()

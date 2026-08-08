@@ -466,6 +466,39 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** 拉服务端排版的分享卡 → 缓存文件 → 系统分享 sheet。context 须是 Activity(chooser 要它)。 */
+    fun shareCard(context: android.content.Context, entryId: String) {
+        viewModelScope.launch {
+            _state.update { it.showToast("正在生成分享卡…") }
+            runCatching {
+                val bytes = api.exportCard(entryId)
+                val file = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val dir = java.io.File(context.cacheDir, "share").apply { mkdirs() }
+                    java.io.File(dir, "keepsake-card-${entryId.take(8)}.jpg").apply { writeBytes(bytes) }
+                }
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file,
+                )
+                val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                    type = "image/jpeg"
+                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(android.content.Intent.createChooser(send, "分享回忆"))
+            }.onFailure { e ->
+                if (e is CancellationException) throw e
+                val msg = friendlyError(
+                    e,
+                    "分享卡生成失败",
+                    mapOf("UNAVAILABLE" to "服务器缺少导出字体,请联系管理员"),
+                )
+                if (msg != null) _state.update { it.copy(error = e.message).showToast(msg) }
+            }
+        }
+    }
+
     fun openEntry(entry: Entry) {
         cancelSessionJobs()
         sessionLoadJob = viewModelScope.launch {

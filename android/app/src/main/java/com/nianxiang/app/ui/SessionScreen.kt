@@ -43,6 +43,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -204,6 +205,7 @@ fun SessionScreen(
                 setEditing = { editingDiary = it },
                 save = viewModel::saveDiary,
                 pickDate = pickDate,
+                share = { viewModel.shareCard(context, entry.id) },
             )
         } else {
             ChatView(
@@ -486,6 +488,7 @@ private fun DiaryView(
     setEditing: (Boolean) -> Unit,
     save: (String, String) -> Unit,
     pickDate: () -> Unit,
+    share: () -> Unit,
 ) {
     var title by remember(entry.id, editing) { mutableStateOf(entry.title) }
     var body by remember(entry.id, editing) { mutableStateOf(entry.diaryText) }
@@ -551,7 +554,11 @@ private fun DiaryView(
                             modifier = Modifier.fillMaxWidth().padding(bottom = 18.dp),
                         )
                     }
-                    NxPill("编辑", { setEditing(true) }, modifier = Modifier.padding(top = 18.dp), icon = Icons.Default.Edit)
+                    Row(Modifier.padding(top = 18.dp), horizontalArrangement = Arrangement.Center) {
+                        NxPill("分享", share, icon = Icons.Default.Share)
+                        Spacer(Modifier.size(10.dp))
+                        NxPill("编辑", { setEditing(true) }, icon = Icons.Default.Edit)
+                    }
                 }
             }
         }
