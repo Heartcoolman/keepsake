@@ -16,7 +16,7 @@ import { isMigrationPending } from '../deferredTasks.ts';
 import { getRegistrationPolicy } from '../ops/opsConfig.ts';
 import { normalizeRecoveryCode, openSealed, randomKey, sealToPub } from '../crypto.ts';
 import { err } from './errors.ts';
-import { forwardedHeader, ipRateLimit, requireAuth, type AppEnv } from './middleware.ts';
+import { clientIp, forwardedHeader, ipRateLimit, requireAuth, type AppEnv } from './middleware.ts';
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -549,6 +549,35 @@ authRoutes.patch('/auth/me/password', requireAuth, async (c) => {
 
 // ---------- recovery ----------
 
+/** Per-username recover throttle, on top of the per-IP limit. Deliberately generous
+ *  and short-windowed: recover is the ONLY password-recovery path, so a hard lockout
+ *  would let anyone DoS a victim by spamming wrong codes. The recovery code is 160-bit
+ *  CSPRNG (unguessable), so this only bounds abusive spraying, not a real brute force. */
+const RECOVER_MAX = 15;
+const RECOVER_WINDOW_MS = 15 * 60_000;
+const recoverHits = new Map<string, { count: number; ts: number }>();
+function recoverThrottled(username: string): boolean {
+  const now = Date.now();
+  if (recoverHits.size > 10_000)
+    for (const [k, v] of recoverHits) if (now - v.ts > RECOVER_WINDOW_MS) recoverHits.delete(k);
+  const h = recoverHits.get(username);
+  if (!h || now - h.ts > RECOVER_WINDOW_MS) {
+    recoverHits.set(username, { count: 1, ts: now });
+    return false;
+  }
+  return ++h.count > RECOVER_MAX;
+}
+function recoverSucceeded(username: string): void {
+  recoverHits.delete(username);
+}
+
+/** Detection signal for account-recovery abuse (there is no SMTP/push to notify the
+ *  owner). Username is sanitized to defeat log injection. */
+function logRecover(c: Context, username: string, ok: boolean): void {
+  const safe = username.replace(/[^\x20-\x7e]/g, '?').slice(0, 64);
+  console.warn(`[auth] recover ${ok ? 'ok' : 'fail'} user="${safe}" ip=${clientIp(c)}`);
+}
+
 authRoutes.post('/auth/recover', ipRateLimit(10), async (c) => {
   const body = await c.req.json<{
     username?: unknown;
@@ -560,10 +589,19 @@ authRoutes.post('/auth/recover', ipRateLimit(10), async (c) => {
   const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
   if (!username || !code) return err(c, 'VALIDATION', 'username and recoveryCode required');
   if (!accounts.validPassword(newPassword)) return err(c, 'VALIDATION', 'password too short');
+  if (recoverThrottled(username)) return err(c, 'RATE_LIMITED', 'too many recovery attempts');
 
   const account = await accounts.findByUsername(username);
-  const keys = account && !account.disabled ? await accounts.unlockKeysWithRecovery(account, code) : null;
-  if (!account || !keys) return err(c, 'UNAUTHORIZED', 'invalid recovery code');
+  // A recovery unwrap only runs scrypt for an enabled account that has recovery
+  // crypto; every other branch would otherwise return instantly. Spend an equivalent
+  // dummy scrypt on those so recover latency can't enumerate usernames (mirrors login).
+  const canUnlock = !!account && !account.disabled && accounts.hasRecoveryCrypto(account);
+  const keys = canUnlock && account ? await accounts.unlockKeysWithRecovery(account, code) : null;
+  if (!account || !keys) {
+    if (!canUnlock) await accounts.dummyRecoveryUnlock();
+    logRecover(c, username, false);
+    return err(c, 'UNAUTHORIZED', 'invalid recovery code');
+  }
 
   const wraps = await accounts.makePasswordWraps(newPassword, keys.udk, keys.priv);
   const recovery = await accounts.makeRecoveryFields(keys.udk, keys.priv);
@@ -581,6 +619,8 @@ authRoutes.post('/auth/recover', ipRateLimit(10), async (c) => {
 
   const fk = await resolveFamilyKey(updated, keys);
   installKeys(updated, keys, fk);
+  recoverSucceeded(username);
+  logRecover(c, username, true);
   const tokens = await accounts.issueTokens(updated);
   setRefreshCookie(c, tokens.refreshToken);
   return c.json({

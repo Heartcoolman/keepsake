@@ -63,6 +63,48 @@ app.onError((error, c) => {
   return c.json({ error: status === 400 ? 'bad request' : 'internal error' }, status as 400 | 500);
 });
 
+// ---------- Security headers + method guard (defense-in-depth).
+// No reverse proxy ships with the app (docker-compose exposes :8787 directly), so
+// the app sets these itself rather than trusting a proxy that may not exist. Set
+// after next() so the SPA catch-all and the raw-Response SSE streams are covered
+// too. HSTS only bites behind a TLS terminator — deploy one (see docs/deploy-tunnel.md).
+// CSP mirrors client/index.html (keep the two in sync) so the in-browser depth
+// fallback (client/src/lib/depth.ts) can still fetch model weights + ORT wasm; it
+// adds frame-ancestors 'none', which a <meta> cannot express — the real clickjacking fix.
+const CSP = [
+  "default-src 'self'",
+  "base-uri 'self'",
+  "object-src 'none'",
+  "frame-ancestors 'none'",
+  "img-src 'self' data: blob:",
+  "style-src 'self' 'unsafe-inline'",
+  "font-src 'self' data:",
+  "script-src 'self' 'wasm-unsafe-eval'",
+  "worker-src 'self' blob:",
+  "connect-src 'self' https://huggingface.co https://*.hf.co https://cdn-lfs.huggingface.co " +
+    'https://cdn-lfs-us-1.huggingface.co https://hf-mirror.com https://*.hf-mirror.com https://cdn.jsdelivr.net',
+  "form-action 'self'",
+].join('; ');
+
+app.use('*', async (c, next) => {
+  // TRACE/TRACK are cross-site-tracing primitives no route needs.
+  if (c.req.method === 'TRACE' || c.req.method === 'TRACK')
+    return c.text('Method Not Allowed', 405, { Allow: 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS' });
+  await next();
+  const h = c.res.headers;
+  h.set('Content-Security-Policy', CSP);
+  h.set('X-Frame-Options', 'DENY');
+  h.set('X-Content-Type-Options', 'nosniff');
+  h.set('Referrer-Policy', 'no-referrer');
+  h.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  // COOP is safe (only affects cross-origin popups the SPA never opens). COEP is
+  // omitted (require-corp would block the cross-origin HuggingFace depth fallback);
+  // CORP is omitted too so a hybrid native shell can still load our assets/API.
+  h.set('Cross-Origin-Opener-Policy', 'same-origin');
+  h.set('X-Permitted-Cross-Domain-Policies', 'none');
+  h.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
+});
+
 // ---------- API v1: the only API surface — auth, per-owner isolation, SSE envelope.
 // See docs/api-v1.md. The old unauthenticated /api/* routes have been removed.
 app.route('/api/v1', createV1Router());
@@ -92,6 +134,15 @@ if (process.env.INFERENCE_DISABLED !== '1') {
 // production: serve the built client regardless of the process working directory.
 const CLIENT_DIST = fileURLToPath(new URL('../../client/dist/', import.meta.url));
 if (existsSync(CLIENT_DIST)) {
+  // The SPA surface is read-only: only GET/HEAD/OPTIONS reach static files. Other
+  // methods on a non-API path previously returned 200 from serveStatic on any
+  // existing file (e.g. PUT / → index.html). /api/* already terminated above.
+  app.use('/*', async (c, next) => {
+    const m = c.req.method;
+    if (m !== 'GET' && m !== 'HEAD' && m !== 'OPTIONS')
+      return c.text('Method Not Allowed', 405, { Allow: 'GET, HEAD, OPTIONS' });
+    await next();
+  });
   app.use('/*', serveStatic({ root: CLIENT_DIST }));
   app.get('*', serveStatic({ path: `${CLIENT_DIST}/index.html` }));
 }

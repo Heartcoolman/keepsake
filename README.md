@@ -83,6 +83,10 @@ pnpm build && pnpm start
 docker compose up --build
 ```
 
+> ⚠️ **传输层**：服务默认纯 HTTP，注册/登录/找回响应会明文携带 token 与一次性
+> recoveryCode。暴露前务必置于 TLS 反代之后，并设 `TRUST_PROXY=1`、`COOKIE_SECURE=1`。
+> 安全响应头由应用自身下发。详见 [docs/deploy-tunnel.md](docs/deploy-tunnel.md)。
+
 ## 半开源说明
 
 本仓库是「念想」的**公开部分**，以 [Elastic License 2.0](LICENSE)（source-available）发布，克隆即可独立构建、以演示模式运行。产品的差异化核心放在私有子模块 `core/`（keepsake-core）中，公开构建以桩实现优雅降级：

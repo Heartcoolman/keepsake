@@ -16,6 +16,7 @@ services:
       - REGISTRATION_CODE=${REGISTRATION_CODE:-}
       - OPS_BOOTSTRAP_TOKEN=${OPS_BOOTSTRAP_TOKEN:-}
       - TRUST_PROXY=${TRUST_PROXY:-0}
+      - COOKIE_SECURE=${COOKIE_SECURE:-}
       # optional host-side DA3 depth sidecar (OpenVINO iGPU); empty = local DA2 fallback
       - DEPTH_SIDECAR_URL=${DEPTH_SIDECAR_URL:-}
       - NODE_ENV=production

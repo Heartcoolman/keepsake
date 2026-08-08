@@ -94,6 +94,13 @@ export function hasCrypto(account: Account): boolean {
   return !!(account.kekSalt && account.encUdk && account.pubKey && account.encPrivKey);
 }
 
+/** Whether a recovery-code unwrap can run — mirrors unlockKeysWithRecovery's guard.
+ *  Lets the recover route decide when a real scrypt has run vs. when it must spend
+ *  an equivalent dummy one so latency can't enumerate usernames. */
+export function hasRecoveryCrypto(account: Account): boolean {
+  return !!(account.recoverySalt && account.encUdkRecovery && account.encPrivKeyRecovery && account.pubKey);
+}
+
 const DIR = fileURLToPath(new URL('../data/accounts/', import.meta.url));
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,32}$/;
@@ -135,6 +142,13 @@ export function validUsername(u: string): boolean {
 
 export function validPassword(p: string): boolean {
   return typeof p === 'string' && p.length >= MIN_PASSWORD && p.length <= 128;
+}
+
+/** Strip C0 control chars + DEL from free-form display text (defense-in-depth: the
+ *  username is already regex-validated; displayName is not). */
+export function stripControl(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 }
 
 /** `s<version>:salt:hash` (both base64url). The legacy two-field `salt:hash` form
@@ -188,6 +202,14 @@ let dummyHashPromise: Promise<string> | null = null;
 export function dummyPasswordHash(): Promise<string> {
   if (!dummyHashPromise) dummyHashPromise = hashPassword(randomUUID() + randomUUID());
   return dummyHashPromise;
+}
+
+/** Burn one scrypt derivation, matching unlockKeysWithRecovery's cost. Called on
+ *  /auth/recover for a missing/disabled/pre-crypto account so its latency matches a
+ *  real wrong-code attempt and cannot be used to enumerate usernames. Unmemoized on
+ *  purpose — a cached promise would return instantly and defeat the equalization. */
+export async function dummyRecoveryUnlock(): Promise<void> {
+  await deriveKek(randomUUID() + randomUUID(), randomBytes(16), KDF_CURRENT);
 }
 
 const envOrNull = (v: unknown): Envelope | null => (isEnvelope(v) ? v : null);
@@ -475,14 +497,23 @@ async function createAccountUnlocked(
   if (requireEmpty && (await countAccounts()) > 0)
     throw Object.assign(new Error('already bootstrapped'), { status: 409 });
   const existing = await findByUsername(input.username);
-  if (existing) throw Object.assign(new Error('username taken'), { status: 409 });
+  if (existing) {
+    // Equalize latency with the create path so a taken username can't be told from
+    // a free one by response time. That path runs three sequential scrypt costs
+    // below (provisionCrypto: 2 deriveKek + hashPassword: 1); match them here. The
+    // 409 is still returned — the client UX needs it.
+    await dummyRecoveryUnlock();
+    await dummyRecoveryUnlock();
+    await dummyRecoveryUnlock();
+    throw Object.assign(new Error('username taken'), { status: 409 });
+  }
   const now = Date.now();
   const provisioned = await provisionCrypto(input.password);
   const account: Account = {
     id: input.id && ID_RE.test(input.id) ? input.id : randomUUID(),
     username: input.username,
     passwordHash: await hashPassword(input.password),
-    displayName: (input.displayName?.trim() || input.username).slice(0, 40),
+    displayName: stripControl(input.displayName?.trim() || input.username).slice(0, 40),
     role: input.role,
     accountType: input.accountType,
     plan: 'free',

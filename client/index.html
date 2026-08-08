@@ -5,10 +5,15 @@
     <!--
       Content-Security-Policy (defense-in-depth; tokens live in localStorage by design).
       Notes:
+      - The server now ALSO sends CSP as an HTTP response header (server/src/index.ts),
+        which is authoritative and adds frame-ancestors 'none' + X-Frame-Options/HSTS that
+        a <meta> cannot express. Keep this meta's directives in sync with that header — the
+        browser enforces the intersection of the two, so a mismatch can silently break the
+        HuggingFace/jsDelivr depth fallback below.
       - This <meta> is stripped in `vite dev` (see stripCspInDev in vite.config.ts) because
         the dev-only React Fast Refresh preamble is an inline script; it stays for `vite build`.
-      - Directives that a <meta> cannot express (frame-ancestors, X-Frame-Options, HSTS,
-        report-to) should be set at the reverse proxy in front of /api and the static app.
+      - A TLS-terminating reverse proxy is still recommended in production (see
+        docs/deploy-tunnel.md); it is where HSTS actually takes effect.
       - 'wasm-unsafe-eval' + worker-src blob: are required by @huggingface/transformers
         (onnxruntime-web compiles WASM and spawns workers) for the in-browser depth fallback.
       - connect-src also lists Hugging Face / mirror / jsDelivr: the depth fallback in

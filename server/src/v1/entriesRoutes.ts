@@ -73,7 +73,17 @@ entriesRoutes.post('/entries', bodyLimit({
   maxSize: 21 * 1024 * 1024,
   onError: (c) => err(c, 'PAYLOAD_TOO_LARGE', 'upload too large'),
 }), async (c) => {
-  const form = await c.req.formData();
+  // This route is multipart-only. Guard the content-type and catch a malformed
+  // body so a JSON (or otherwise unparseable) payload is a clean 400, not a 500
+  // from an unhandled formData() TypeError.
+  if (!(c.req.header('content-type') ?? '').toLowerCase().includes('multipart/form-data'))
+    return err(c, 'VALIDATION', 'multipart/form-data required');
+  let form: FormData;
+  try {
+    form = await c.req.formData();
+  } catch {
+    return err(c, 'VALIDATION', 'invalid multipart form');
+  }
   const metaRaw = form.get('meta');
   const image = form.get('image');
   const thumb = form.get('thumb');

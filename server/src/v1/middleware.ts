@@ -91,7 +91,7 @@ export function userRateLimit(maxPerMin: number): MiddlewareHandler<AppEnv> {
   };
 }
 
-function clientIp(c: Context): string {
+export function clientIp(c: Context): string {
   return forwardedHeader(c, 'x-forwarded-for') || getConnInfo(c).remote.address || 'local';
 }
 
