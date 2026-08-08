@@ -42,8 +42,15 @@ export function box(style: Record<string, unknown>, children: unknown): Node {
 }
 
 export function cleanText(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return (
+    s
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+      // the bundled CJK fonts have no colour-emoji glyphs — satori would draw tofu
+      .replace(/\p{Extended_Pictographic}|[\u{FE00}-\u{FE0F}\u{200D}]/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
 }
 
 export function excerpt(s: string, max: number): string {
@@ -136,7 +143,7 @@ export async function renderCard(data: CardData): Promise<Buffer> {
     );
   children.push(
     box({ justifyContent: 'space-between', marginTop: 36, fontSize: 26, color: '#8f8578' }, [
-      box({}, [data.dateLabel, data.peopleLabel].filter(Boolean).join(' · ')),
+      box({}, cleanText([data.dateLabel, data.peopleLabel].filter(Boolean).join(' · '))),
       box({}, '念想 · Keepsake'),
     ]),
   );
