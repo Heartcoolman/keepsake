@@ -3,11 +3,20 @@
  *  photo; when it is unreachable we fall back to the old transformers.js path
  *  (~40MB weights downloaded on first use, single-layer only). */
 
+/** per-pixel semantic class from the parsing head, on the same grid as the depth map:
+ *  0 bg / 1 hair / 2 skin / 3 clothes / 4 accessory, plus 5 sky / 6 vegetation /
+ *  7 building / 8 water / 9 ground from v6 on. Human labels arrive already gated to the
+ *  matte's foreground. Absent on servers without the parsing model, and on the in-browser
+ *  fallback, so every consumer has to behave as it did before the channel existed. */
+export type Parts = Uint8Array;
+
 export interface DepthMap {
   /** 0..1 per pixel, 1 = nearest to camera */
   data: Float32Array;
   width: number;
   height: number;
+  /** present on an unlayered server response — the scene classes are all such a photo has */
+  parts?: Parts;
 }
 
 /** server-computed layer decomposition: fg mask + inpainted occluded background */
@@ -22,9 +31,7 @@ export interface DepthLayers {
   bg: Uint8Array;
   /** inpainted background depth */
   bgDepth: Uint8Array;
-  /** per-pixel semantic class (0 bg / 1 hair / 2 skin / 3 clothes / 4 accessory), already
-   *  gated to the matte's foreground. Absent on servers without the parsing model. */
-  parts?: Uint8Array;
+  parts?: Parts;
 }
 
 export interface DepthResult {
@@ -55,10 +62,12 @@ async function serverDepth(entryId: string, signal?: AbortSignal): Promise<Depth
       parts?: string;
     };
     const depthU8 = fromB64(j.depth);
+    const parts = j.parts ? fromB64(j.parts) : undefined;
     const depth: DepthMap = {
       data: Float32Array.from(depthU8, (v) => v / 255),
       width: j.width,
       height: j.height,
+      ...(parts ? { parts } : {}),
     };
     if (!j.layered || !j.mask || !j.bg || !j.bgDepth) return { depth, layers: null };
     console.info(`[depth] server layers ready ${j.width}x${j.height}`);
@@ -71,7 +80,7 @@ async function serverDepth(entryId: string, signal?: AbortSignal): Promise<Depth
         mask: fromB64(j.mask),
         bg: fromB64(j.bg),
         bgDepth: fromB64(j.bgDepth),
-        ...(j.parts ? { parts: fromB64(j.parts) } : {}),
+        ...(parts ? { parts } : {}),
       },
     };
   } catch (e) {
