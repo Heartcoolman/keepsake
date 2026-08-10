@@ -14,6 +14,9 @@ import * as ops from './opsAccounts.ts';
 import { clearAnalyzeCaches } from '../analyzeCache.ts';
 import { clearDepthCaches } from '../depth.ts';
 import { isMigrationPending } from '../deferredTasks.ts';
+import { reset as resetPerf } from '../perf.ts';
+import { benchInFlight, benchSummary, runBenchmark } from './bench.ts';
+import { getModelsSnapshot, invalidateModelsSnapshot } from './modelInfo.ts';
 import { err } from '../v1/errors.ts';
 import { ipRateLimit } from '../v1/middleware.ts';
 import { audit, readAuditTail } from './audit.ts';
@@ -294,6 +297,27 @@ opsRoutes.post('/system/cache/clear', opsBodyLimit, async (c) => {
   const removed = kind === 'depth' ? await clearDepthCaches() : await clearAnalyzeCaches();
   audit(c.get('operator'), 'cache.clear', kind, `${removed} file(s)`);
   return c.json({ removed });
+});
+
+// ---------- models ----------
+
+opsRoutes.get('/models', async (c) =>
+  c.json(await getModelsSnapshot(c.req.query('refresh') === '1')),
+);
+
+opsRoutes.post('/models/bench', async (c) => {
+  const operator = c.get('operator');
+  if (benchInFlight()) return err(c, 'CONFLICT', 'a benchmark is already running');
+  const result = await runBenchmark(operator.username);
+  audit(operator, 'model.bench', 'all', benchSummary(result));
+  return c.json(result);
+});
+
+opsRoutes.post('/models/perf/reset', async (c) => {
+  resetPerf();
+  invalidateModelsSnapshot();
+  audit(c.get('operator'), 'model.perf.reset', 'all', '');
+  return c.json({ ok: true });
 });
 
 // ---------- backups ----------

@@ -19,8 +19,13 @@ import {
 } from './crypto.ts';
 import * as store from './store.ts';
 import * as people from './people.ts';
+import type { FaceDescription } from './modelTypes.ts';
 
 const MODEL_VERSION = 'buffalo_l-2';
+/** ETag input for face-thumb responses (v1/entriesRoutes.ts). Thumb cache hits still
+ *  serve in this build, so the constant must exist; only the crop geometry it encodes
+ *  in the real pipeline is missing here. */
+export const FACE_THUMB_VERSION = MODEL_VERSION;
 
 const local = (p: string): string => fileURLToPath(new URL(p, import.meta.url));
 const CACHE_DIR = local('../cache/face/');
@@ -40,6 +45,23 @@ const UNAVAILABLE = 'face recognition is part of the private core module — not
 // ---------- ML pipeline: private core only ----------
 
 export function prewarmFace(): void {
+  throw new Error(UNAVAILABLE);
+}
+
+/** Ops 模型 panel — describes, never throws: the panel must render on a stub build. */
+export function describeFace(): FaceDescription {
+  const absent = { file: '', present: false, warm: false };
+  return {
+    available: false,
+    modelVersion: MODEL_VERSION,
+    thumbVersion: FACE_THUMB_VERSION,
+    det: absent,
+    rec: { ...absent },
+  };
+}
+
+/** Ops benchmark hook — no recognition model in this build. */
+export async function benchEmbed(): Promise<number> {
   throw new Error(UNAVAILABLE);
 }
 

@@ -7,6 +7,7 @@ import { PDFDocument } from 'pdf-lib';
 import * as store from './store.ts';
 import * as people from './people.ts';
 import { xaiChat } from './xai.ts';
+import { LABELS, timed } from './perf.ts';
 import {
   backPage,
   coverPage,
@@ -61,9 +62,36 @@ export function finishJob(accountId: string, year: number, pdf: Buffer | null, p
   jobs.set(key, { status: 'done', pdf, pages, createdAt: Date.now() });
 }
 
-function ymdCn(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日`;
+/** Counts only — the ops console has no business knowing whose book is rendering. */
+export function jobStats(): { running: number; parked: number; parkedBytes: number } {
+  sweep();
+  let running = 0;
+  let parked = 0;
+  let parkedBytes = 0;
+  for (const j of jobs.values()) {
+    if (j.status === 'running') running++;
+    else {
+      parked++;
+      parkedBytes += j.pdf?.length ?? 0;
+    }
+  }
+  return { running, parked, parkedBytes };
+}
+
+/** Date labels on cards and book pages must match the date the apps show for the same
+ *  memory. The container clock is UTC, so the zone is explicit (APP_TZ) rather than
+ *  whatever the process happens to run in — otherwise anything before 08:00 local is
+ *  stamped a day early. */
+const YMD = new Intl.DateTimeFormat('en-US', {
+  timeZone: process.env.APP_TZ || 'Asia/Shanghai',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+});
+
+export function ymdCn(ts: number): string {
+  const p = new Map(YMD.formatToParts(ts).map((x) => [x.type, x.value]));
+  return `${p.get('year')} 年 ${Number(p.get('month'))} 月 ${Number(p.get('day'))} 日`;
 }
 
 const PREFACE_SYSTEM =
@@ -167,7 +195,15 @@ async function resolveNames(source: AnnualSource): Promise<Map<string, string>> 
 
 /** Build the whole book. Emits progress per page; honours the abort signal between
  *  pages so a dropped client stops burning CPU. Returns the PDF bytes. */
-export async function generateAnnual(
+export function generateAnnual(
+  source: AnnualSource,
+  signal: AbortSignal,
+  onProgress: (p: AnnualProgress) => void,
+): Promise<{ pdf: Buffer; pages: number; prefaceUsedAi: boolean }> {
+  return timed(LABELS.exportAnnual, () => generateAnnualImpl(source, signal, onProgress));
+}
+
+async function generateAnnualImpl(
   source: AnnualSource,
   signal: AbortSignal,
   onProgress: (p: AnnualProgress) => void,

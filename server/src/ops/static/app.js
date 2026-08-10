@@ -56,6 +56,13 @@ function fmtTime(ts) {
   return ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '—';
 }
 
+function fmtMs(ms) {
+  if (ms == null || !Number.isFinite(ms)) return '—';
+  if (ms >= 10000) return (ms / 1000).toFixed(1) + ' s';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s';
+  return Math.round(ms) + ' ms';
+}
+
 function fmtDuration(seconds) {
   if (seconds >= 86400) return (seconds / 86400).toFixed(1) + ' 天';
   if (seconds >= 3600) return (seconds / 3600).toFixed(1) + ' 小时';
@@ -286,6 +293,7 @@ function renderGate(notice) {
 
 const TABS = [
   ['overview', '概览'],
+  ['models', '模型'],
   ['accounts', '账户'],
   ['families', '家庭'],
   ['usage', '用量'],
@@ -334,6 +342,7 @@ async function loadTab() {
   replace($section, el('p', { class: 'muted' }, '加载中…'));
   try {
     if (currentTab === 'overview') await tabOverview();
+    else if (currentTab === 'models') await tabModels();
     else if (currentTab === 'accounts') await tabAccounts();
     else if (currentTab === 'families') await tabFamilies();
     else if (currentTab === 'usage') await tabUsage();
@@ -391,7 +400,11 @@ async function tabOverview() {
       el('div', { class: 'card' }, el('div', { class: 'k' }, '内存密钥环(账户/家庭)'), el('div', { class: 'v' }, sys.keyring.unlockedAccounts + ' / ' + sys.keyring.unlockedFamilies)),
       el('div', { class: 'card' }, el('div', { class: 'k' }, '运行时长'), el('div', { class: 'v' }, fmtDuration(sys.uptimeSeconds))),
       el('div', { class: 'card' }, el('div', { class: 'k' }, '内存占用'), el('div', { class: 'v' }, fmtBytes(sys.rssBytes))),
-      el('div', { class: 'card' }, el('div', { class: 'k' }, 'Node'), el('div', { class: 'v' }, sys.nodeVersion + (sys.mockAi ? ' · MOCK' : ''))),
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, 'Node'),
+        el('div', { class: 'v' }, sys.nodeVersion + (sys.mockAi ? ' · MOCK' : '')),
+        sys.inferenceDisabled ? el('div', { style: 'margin-top:4px' }, el('span', { class: 'pill bad' }, '推理已禁用')) : null,
+      ),
     ),
     el('h2', null, '磁盘占用'),
     el('div', { class: 'row', style: 'margin-bottom:8px' },
@@ -437,6 +450,185 @@ async function tabOverview() {
           } }, '删除')),
         )) : el('tr', null, el('td', { colspan: '4', class: 'muted' }, '暂无备份'))),
     )),
+  );
+}
+
+// ---------- 模型 ----------
+
+const BACKEND_TEXT = { sidecar: 'sidecar (核显)', local: '本地 CPU', unavailable: '不可用' };
+const ROLE_PILL = {
+  active: ['ok', '生效'],
+  fallback: ['', '备用'],
+  orphan: ['warn', '未被引用'],
+};
+
+function slotRow(s) {
+  return el('tr', null,
+    el('td', null, el('strong', null, s.label)),
+    el('td', null, s.file || el('span', { class: 'muted' }, '缺失')),
+    el('td', { class: 'muted' }, s.version || '—'),
+    el('td', null, el('span', { class: 'pill' + (s.backend === 'unavailable' ? ' bad' : ' ok') }, BACKEND_TEXT[s.backend] || s.backend)),
+    el('td', null, s.backend === 'unavailable'
+      ? el('span', { class: 'muted' }, '—')
+      : el('span', { class: 'pill ' + (s.warm ? 'ok' : 'warn') }, s.warm ? '已预热' : '冷')),
+  );
+}
+
+function perfRow(p) {
+  const silent = p.count === 0;
+  return el('tr', null,
+    el('td', null, p.label),
+    el('td', { class: 'num' }, silent ? el('span', { class: 'muted' }, '—') : String(p.count)),
+    el('td', { class: 'num' }, p.failures
+      ? el('span', { class: 'pill bad' }, String(p.failures))
+      : el('span', { class: 'muted' }, silent ? '—' : '0')),
+    el('td', { class: 'num' }, fmtMs(p.p50)),
+    el('td', { class: 'num' }, fmtMs(p.p95)),
+    el('td', { class: 'num' }, fmtMs(p.lastMs)),
+    el('td', { class: 'muted' }, p.lastAt ? fmtTime(p.lastAt) + (p.lastOk ? '' : ' · 失败') : '—'),
+  );
+}
+
+function benchTable(result) {
+  return [
+    el('h2', null, '基准结果'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '项目'), el('th', null, '状态'), el('th', { class: 'num' }, '耗时'),
+        el('th', null, '路径'), el('th', null, '备注'))),
+      el('tbody', null, result.rows.map((r) =>
+        el('tr', null,
+          el('td', null, r.label),
+          el('td', null, el('span', { class: 'pill ' + (r.status === 'ok' ? 'ok' : r.status === 'error' ? 'bad' : 'warn') }, r.status)),
+          el('td', { class: 'num' }, r.runs.length ? r.runs.map((v) => fmtMs(v)).join(' / ') : '—'),
+          el('td', null, r.backend || el('span', { class: 'muted' }, '—')),
+          el('td', { class: 'muted' }, r.note || ''),
+        ))),
+    )),
+    el('p', { class: 'muted' }, '深度跑两次(两张不同的合成图,第二次不是缓存命中);两个数的差异反映的是推理引擎对新输入形状的首次特化,不是冷启动。'),
+  ];
+}
+
+async function tabModels() {
+  const m = await api('/models');
+  const benchBox = el('div');
+
+  const runBench = async (e) => {
+    const btn = e.currentTarget;
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '测试中…';
+    toast('基准测试进行中,勿关闭页面…', false, true);
+    try {
+      const result = await api('/models/bench', { method: 'POST' });
+      toast('基准测试完成');
+      replace(benchBox, benchTable(result));
+    } catch (err) {
+      if (!err.silent) toast(friendly(err, { CONFLICT: '已有一个基准测试在跑,请稍候' }), true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  };
+
+  replace($section,
+    el('div', { class: 'row', style: 'margin-bottom:12px' },
+      el('span', { class: 'muted' }, '统计时间 ' + fmtTime(m.generatedAt) + '(15 秒缓存)'),
+      el('button', { class: 'small', onclick: (e) => act(() => api('/models?refresh=1'), '', e.currentTarget) }, '刷新 / 重探 sidecar'),
+    ),
+    el('div', { class: 'cards' },
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, '本地推理'),
+        el('div', { class: 'v' }, m.flags.inferenceDisabled
+          ? el('span', { class: 'pill bad' }, '已禁用')
+          : el('span', { class: 'pill ok' }, '启用')),
+      ),
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, 'AI provider'),
+        el('div', { class: 'v' }, m.ai.model),
+        el('div', { class: 'muted' }, m.ai.baseUrlHost + (m.ai.mock ? ' · MOCK' : m.ai.keyConfigured ? '' : ' · 未配置密钥')),
+      ),
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, '导出字体'),
+        el('div', { class: 'v' }, m.fonts.ready
+          ? el('span', { class: 'pill ok' }, m.fonts.loaded ? '已就位 · 已加载' : '已就位')
+          : el('span', { class: 'pill bad' }, '缺失 → 导出 503')),
+        el('div', { class: 'muted' }, 'APP_TZ ' + m.appTz),
+      ),
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, '推理队列'),
+        el('div', { class: 'v' }, m.queue.pendingInteractive + ' / ' + m.queue.pendingBatch),
+        el('div', { class: 'muted' }, (m.queue.running ? '正在执行' : '空闲') + ' · 上限 ' + m.queue.maxPending + ' · 超时 ' + fmtMs(m.queue.timeoutMs)),
+      ),
+      el('div', { class: 'card' },
+        el('div', { class: 'k' }, '年度册作业'),
+        el('div', { class: 'v' }, String(m.annual.running)),
+        el('div', { class: 'muted' }, m.annual.parked + ' 份待下载 · ' + fmtBytes(m.annual.parkedBytes)),
+      ),
+    ),
+
+    el('h2', null, '模型槽位'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '用途'), el('th', null, '权重文件'), el('th', null, '版本'),
+        el('th', null, '后端'), el('th', null, '会话'))),
+      el('tbody', null, m.slots.map(slotRow)),
+    )),
+
+    el('h2', null, 'Sidecar'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '名称'), el('th', null, 'URL'), el('th', null, '/healthz'),
+        el('th', { class: 'num' }, '探测耗时'), el('th', null, '探测时间'))),
+      el('tbody', null, m.sidecars.map((s) =>
+        el('tr', null,
+          el('td', null, s.key),
+          el('td', { class: 'muted' }, s.url || '—'),
+          el('td', null, !s.configured
+            ? el('span', { class: 'muted' }, '未配置')
+            : el('span', { class: 'pill ' + (s.ok ? 'ok' : 'bad') }, s.detail)),
+          el('td', { class: 'num' }, fmtMs(s.probeMs)),
+          el('td', { class: 'muted' }, s.checkedAt ? fmtTime(s.checkedAt) : '—'),
+        ))),
+    )),
+    el('p', { class: 'muted' }, 'sidecar 不可用不会报错,只会静默回落本地 CPU —— 表现为「变慢」。下面的速度表里 sidecar 与本地同时有采样,就是回落正在发生。'),
+
+    el('h2', null, '模型文件'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '文件'), el('th', { class: 'num' }, '大小'), el('th', null, '修改时间'), el('th', null, '角色'))),
+      el('tbody', null, m.files.length ? m.files.map((f) =>
+        el('tr', null,
+          el('td', null, f.name),
+          el('td', { class: 'num' }, fmtBytes(f.bytes)),
+          el('td', { class: 'muted' }, fmtTime(f.modifiedAt)),
+          el('td', null, el('span', { class: 'pill ' + ROLE_PILL[f.role][0] }, ROLE_PILL[f.role][1])),
+        )) : el('tr', null, el('td', { colspan: '4', class: 'muted' }, '目录为空(公开构建不带权重)'))),
+    )),
+
+    el('h2', null, '运行速度(本次进程启动以来)'),
+    el('div', { class: 'row', style: 'margin-bottom:8px' },
+      el('span', { class: 'muted' }, '被动采样真实请求,只保留最近 128 次;失败不进分位数。重启清零。'),
+      el('button', { class: 'small', onclick: async (e) => {
+        const btn = e.currentTarget;
+        if (await modalConfirm('清零全部速度统计?', { danger: false, confirmLabel: '清零' }))
+          act(() => api('/models/perf/reset', { method: 'POST' }), '统计已清零', btn);
+      } }, '清零'),
+    ),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '指标'), el('th', { class: 'num' }, '次数'), el('th', { class: 'num' }, '失败'),
+        el('th', { class: 'num' }, 'p50'), el('th', { class: 'num' }, 'p95'),
+        el('th', { class: 'num' }, '最近一次'), el('th', null, '最近时间'))),
+      el('tbody', null, m.perf.map(perfRow)),
+    )),
+
+    el('h2', null, '基准测试'),
+    el('div', { class: 'row' },
+      el('button', { class: 'primary', onclick: runBench }, '立即基准测试'),
+      el('span', { class: 'muted' }, '合成图跑一遍各模型(批量优先级,不插队真实用户)。AI provider 探测会发出一次真实计费调用,不计入任何账户用量。'),
+    ),
+    benchBox,
   );
 }
 

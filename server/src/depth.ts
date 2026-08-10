@@ -11,13 +11,44 @@ import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { writeAtomic } from './lib/atomicFile.ts';
 import { decryptBuffer, encryptBuffer, isEncryptedBuffer } from './crypto.ts';
+import type { InferenceDescription } from './modelTypes.ts';
 
 const local = (p: string): string => fileURLToPath(new URL(p, import.meta.url));
 const CACHE_DIR = local('../cache/depth/');
 
+/** ETag input for depth responses (v1/entriesRoutes.ts). Nothing in this build can
+ *  produce a depth response from scratch, but cache hits from a full deployment still
+ *  serve, so the constant has to exist and stay stable. */
+export const DEPTH_OUTPUT_VERSION = 'stub';
+
 /** kick off model download + session init at server start so first request is fast */
 export function prewarmDepth(): void {
   // no model in the public build — nothing to prewarm
+}
+
+/** Ops 模型 panel. The real version reports the depth backend and folds in matting.ts
+ *  (which does not exist in this build at all); the stub reports "nothing here". */
+export function describeInference(): InferenceDescription {
+  return {
+    available: false,
+    depth: {
+      backend: 'unavailable',
+      sidecarUrl: null,
+      tiles: 0,
+      gridSize: 0,
+      modelFile: null,
+      outputVersion: DEPTH_OUTPUT_VERSION,
+      warm: false,
+    },
+    matting: {
+      backend: 'unavailable',
+      sidecarUrl: null,
+      modelFile: null,
+      version: null,
+      warm: false,
+      partsWarm: false,
+    },
+  };
 }
 
 const validDepthJson = (raw: string): boolean => {

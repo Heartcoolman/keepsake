@@ -294,6 +294,39 @@ test('ops console end to end', { timeout: 120_000 }, async () => {
     assert.ok(system.body.disk['data/entries'].files >= 1);
     assert.ok(system.body.migration.every((m: { legacyEntries: number }) => m.legacyEntries === 0));
 
+    // ---------- model panel: structural only, and honest about a disabled build ----------
+    assert.equal((await json(base, '/api/ops/models')).response.status, 401);
+
+    const models = await json(base, '/api/ops/models', { headers: opsAuth });
+    assert.equal(models.response.status, 200);
+    assert.deepEqual(
+      models.body.slots.map((s: { key: string }) => s.key),
+      ['depth', 'matting', 'face-det', 'face-rec'],
+    );
+    // the harness runs INFERENCE_DISABLED=1 and never copies server/models
+    assert.ok(models.body.slots.every((s: { warm: boolean }) => s.warm === false));
+    assert.equal(models.body.flags.inferenceDisabled, true);
+    assert.equal(models.body.flags.mockAi, true);
+    assert.equal(models.body.ai.mock, true);
+    assert.ok(models.body.sidecars.every((s: { configured: boolean }) => s.configured === false));
+    // every canonical perf label is present even with zero samples, so the table is stable
+    const perfLabels = models.body.perf.map((p: { label: string }) => p.label);
+    assert.ok(perfLabels.includes('depth.sidecar') && perfLabels.includes('llm.blocking'));
+
+    const bench = await json(base, '/api/ops/models/bench', { method: 'POST', headers: opsAuth });
+    assert.equal(bench.response.status, 200);
+    const byKey = new Map<string, { status: string }>(
+      bench.body.rows.map((r: { key: string; status: string }) => [r.key, r]),
+    );
+    for (const key of ['depth', 'face-det', 'face-rec'])
+      assert.equal(byKey.get(key)?.status, 'disabled', `${key} should report disabled, not fail`);
+    assert.equal(byKey.get('llm')?.status, 'mocked');
+
+    assert.equal(
+      (await json(base, '/api/ops/models/perf/reset', { method: 'POST', headers: opsAuth })).response.status,
+      200,
+    );
+
     // ---------- backups ----------
     const backup = await json(base, '/api/ops/backups', { method: 'POST', headers: opsAuth });
     assert.equal(backup.response.status, 201);
@@ -357,7 +390,7 @@ test('ops console end to end', { timeout: 120_000 }, async () => {
     for (const expected of [
       'ops.bootstrap', 'account.disable', 'account.enable', 'account.delete',
       'family.dissolve', 'registration.update', 'backup.create', 'backup.delete',
-      'operator.create', 'operator.delete',
+      'operator.create', 'operator.delete', 'model.bench', 'model.perf.reset',
     ]) {
       assert.ok(actions.includes(expected), `audit missing ${expected}`);
     }
