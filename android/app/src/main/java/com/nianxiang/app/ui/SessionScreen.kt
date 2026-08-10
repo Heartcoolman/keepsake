@@ -206,6 +206,7 @@ fun SessionScreen(
                 save = viewModel::saveDiary,
                 pickDate = pickDate,
                 share = { viewModel.shareCard(context, entry.id) },
+                sharing = state.sharingCard,
             )
         } else {
             ChatView(
@@ -489,6 +490,7 @@ private fun DiaryView(
     save: (String, String) -> Unit,
     pickDate: () -> Unit,
     share: () -> Unit,
+    sharing: Boolean,
 ) {
     var title by remember(entry.id, editing) { mutableStateOf(entry.title) }
     var body by remember(entry.id, editing) { mutableStateOf(entry.diaryText) }
@@ -555,7 +557,12 @@ private fun DiaryView(
                         )
                     }
                     Row(Modifier.padding(top = 18.dp), horizontalArrangement = Arrangement.Center) {
-                        NxPill("分享", share, icon = Icons.Default.Share)
+                        NxPill(
+                            if (sharing) "生成中…" else "分享",
+                            share,
+                            enabled = !sharing,
+                            icon = Icons.Default.Share,
+                        )
                         Spacer(Modifier.size(10.dp))
                         NxPill("编辑", { setEditing(true) }, icon = Icons.Default.Edit)
                     }

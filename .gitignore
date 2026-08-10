@@ -37,3 +37,6 @@ parsing-data/
 .cursor/
 .ccpanes/
 CLAUDE.md
+# Pre-rewrite history bundles. The public tree's history starts after the split;
+# these hold the commits that predate it. Local keepsake only, never pushed.
+_archive/

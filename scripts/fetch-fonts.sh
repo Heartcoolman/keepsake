@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# 下载导出功能(分享卡/年度册)所需的 CJK 字体到 server/assets/fonts/。
-# 字体不进 git(体积大、许可 OFL 允许再分发但没必要入库);本地开发与部署主机各跑一次。
+# 预取导出功能(分享卡/年度册)所需的 CJK 字体到 server/assets/fonts/。
+# 字体不进 git(体积大、许可 OFL 允许再分发但没必要入库)。服务端首次导出时会自己下载
+# (server/src/exports/render.ts),这个脚本只是把下载提前到构建/部署主机上——镜像
+# 的 COPY server server 随后会把字体带进去,省掉线上那次等待。
 # 缺字体时导出端点返回 503 EXPORT_FONTS_MISSING,其余功能不受影响。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

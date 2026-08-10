@@ -84,6 +84,7 @@ data class UiState(
     val phase: String = "idle",
     val sessionTab: String = "diary",
     val busy: Boolean = false,
+    val sharingCard: Boolean = false,
     val uploadProgress: String = "",
     val toast: String? = null,
     /** Bumped on every toast so identical back-to-back messages restart the dismiss timer. */
@@ -468,8 +469,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 拉服务端排版的分享卡 → 缓存文件 → 系统分享 sheet。context 须是 Activity(chooser 要它)。 */
     fun shareCard(context: android.content.Context, entryId: String) {
+        if (_state.value.sharingCard) return // a second chooser would stack on the first
         viewModelScope.launch {
-            _state.update { it.showToast("正在生成分享卡…") }
+            _state.update { it.copy(sharingCard = true).showToast("正在生成分享卡…") }
             runCatching {
                 val bytes = api.exportCard(entryId)
                 val file = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -488,7 +490,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 context.startActivity(android.content.Intent.createChooser(send, "分享回忆"))
             }.onFailure { e ->
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    _state.update { it.copy(sharingCard = false) }
+                    throw e
+                }
                 val msg = friendlyError(
                     e,
                     "分享卡生成失败",
@@ -496,6 +501,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 if (msg != null) _state.update { it.copy(error = e.message).showToast(msg) }
             }
+            _state.update { it.copy(sharingCard = false) }
         }
     }
 

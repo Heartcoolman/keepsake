@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchAnnualFile, generateAnnualBook, type AnnualProgress } from '../lib/api';
 import { useEntriesStore } from '../lib/db';
 import { friendlyError } from '../lib/http';
@@ -23,16 +23,23 @@ export function AnnualBookOverlay({ onClose }: { onClose: () => void }) {
   const [stage, setStage] = useState<Stage>('idle');
   const [progress, setProgress] = useState<AnnualProgress | null>(null);
   const busyRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
   const panelRef = useDialog(true, onClose);
+
+  // closing the dialog abandons the book: the stream stops, and no download or toast
+  // may surface minutes later on a screen the user has already moved on from
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   async function generate() {
     if (busyRef.current) return;
     busyRef.current = true;
+    const ac = new AbortController();
+    abortRef.current = ac;
     setStage('working');
     setProgress(null);
     try {
-      await generateAnnualBook(year, setProgress);
-      const blob = await fetchAnnualFile(year);
+      await generateAnnualBook(year, setProgress, ac.signal);
+      const blob = await fetchAnnualFile(year, ac.signal);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -42,6 +49,7 @@ export function AnnualBookOverlay({ onClose }: { onClose: () => void }) {
       setStage('ready');
       showToast(`《${year} 年度回忆册》已生成并开始下载`);
     } catch (e) {
+      if (ac.signal.aborted) return;
       setStage('idle');
       const msg = friendlyError(e, '年度册生成失败,请稍后再试', {
         VALIDATION: '这一年还没有回忆,换一年试试',
@@ -57,7 +65,16 @@ export function AnnualBookOverlay({ onClose }: { onClose: () => void }) {
   const pct = progress && progress.total > 0 ? Math.round((progress.step / progress.total) * 100) : 0;
 
   return (
-    <div className="share-overlay" onClick={stage === 'working' ? undefined : onClose} role="presentation">
+    // the overlay is nested inside the review overlay's own scrim — swallow the click
+    // so backing out of this dialog never tears down the panel behind it
+    <div
+      className="share-overlay"
+      onClick={(e) => {
+        e.stopPropagation();
+        if (stage !== 'working') onClose();
+      }}
+      role="presentation"
+    >
       <div
         className="share-panel annual-panel"
         ref={panelRef}

@@ -2,9 +2,11 @@
  *
  *  Both serve decrypted content, so the whole group sits behind requireKeys, and both
  *  stream straight out of RAM — no plaintext export ever touches disk. Foreign entry
- *  ids 404 like everywhere else (no existence leak). Fonts are an install-time asset
- *  (scripts/fetch-fonts.sh); without them these routes 503 and nothing else is affected. */
+ *  ids 404 like everywhere else (no existence leak). Fonts download on first use (or
+ *  via scripts/fetch-fonts.sh); until they land these routes 503 and nothing else is
+ *  affected. */
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import * as store from '../store.ts';
 import * as keyring from '../keyring.ts';
 import * as accounts from '../accounts.ts';
@@ -19,10 +21,10 @@ export const exportsRoutes = new Hono<AppEnv>();
 
 exportsRoutes.use('*', requireKeys);
 
-function ymdCn(ts: number): string {
-  const d = new Date(ts);
-  return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日`;
-}
+const annualBodyLimit = bodyLimit({
+  maxSize: 4 * 1024,
+  onError: (c) => err(c, 'PAYLOAD_TOO_LARGE', 'payload too large'),
+});
 
 exportsRoutes.get('/exports/card/:id', userRateLimit(30), async (c) => {
   if (!(await fontsReady())) return err(c, 'UNAVAILABLE', 'export fonts missing');
@@ -59,8 +61,10 @@ exportsRoutes.get('/exports/card/:id', userRateLimit(30), async (c) => {
     const jpeg = await renderCard({
       photo,
       title: entry.title,
-      body: entry.diaryText || entry.imageDescription || '',
-      dateLabel: ymdCn(entry.takenAt),
+      // diary only — imageDescription is the internal photo analysis written for the
+      // model, never for anyone to read, let alone to share
+      body: entry.diaryText || '',
+      dateLabel: annual.ymdCn(entry.takenAt),
       peopleLabel,
     });
     return c.body(new Uint8Array(jpeg), 200, {
@@ -76,7 +80,7 @@ exportsRoutes.get('/exports/card/:id', userRateLimit(30), async (c) => {
 
 /** POST { year } → SSE progress stream while the book renders; the finished PDF is
  *  parked in RAM for a short window and fetched via GET /exports/annual/:year/file. */
-exportsRoutes.post('/exports/annual', userRateLimit(4), requireAiEntitlement, async (c) => {
+exportsRoutes.post('/exports/annual', annualBodyLimit, userRateLimit(4), requireAiEntitlement, async (c) => {
   if (!(await fontsReady())) return err(c, 'UNAVAILABLE', 'export fonts missing');
   let year: number;
   try {

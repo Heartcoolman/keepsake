@@ -3,6 +3,11 @@ import { useEffect, useRef } from 'react';
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+/** Open dialogs, innermost last. Every dialog listens on `document`, where
+ *  stopPropagation cannot stop a sibling listener — so Escape is dispatched by
+ *  position in this stack and a nested dialog closes only itself. */
+const stack: symbol[] = [];
+
 /**
  * Modal accessibility helper: when `open`, moves focus into the dialog, restores focus to the
  * previously-focused element on close, traps Tab within the dialog, and closes on Escape.
@@ -19,12 +24,15 @@ export function useDialog(
   useEffect(() => {
     if (!open) return;
     const node = ref.current;
+    const id = Symbol('dialog');
+    stack.push(id);
     const previouslyFocused = document.activeElement as HTMLElement | null;
     const focusables = (): HTMLElement[] =>
       node ? Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE)) : [];
     (focusables()[0] ?? node)?.focus?.();
 
     const onKeyDown = (e: KeyboardEvent): void => {
+      if (stack[stack.length - 1] !== id) return; // only the innermost dialog reacts
       if (e.key === 'Escape') {
         if (closeOnEsc) {
           e.stopPropagation();
@@ -54,6 +62,7 @@ export function useDialog(
     document.addEventListener('keydown', onKeyDown, true);
     return () => {
       document.removeEventListener('keydown', onKeyDown, true);
+      stack.splice(stack.indexOf(id), 1);
       previouslyFocused?.focus?.();
     };
   }, [open, onClose, closeOnEsc]);

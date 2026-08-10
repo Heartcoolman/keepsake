@@ -52,7 +52,9 @@ export function SessionView() {
         </div>
       )}
 
-      {showDiaryUI && entryId && (
+      {/* diary tab of a finished memory only: mid-stream the diary is not saved yet,
+          and on the 对话 tab the face chips sit on top of this corner */}
+      {phase === 'done' && sessionTab === 'diary' && entryId && (
         <button className="share-btn" title="生成分享卡" onClick={() => setShareOpen(true)}>
           ⤴ 分享
         </button>
