@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
+import { sweepOrphanTransients } from './lib/atomicFile.ts';
 import * as store from './store.ts';
 import * as accounts from './accounts.ts';
 import { countOpsAccounts } from './ops/opsAccounts.ts';
@@ -162,6 +163,19 @@ async function adoptUnownedLegacyEntries(): Promise<void> {
     if (updated) adopted++;
   }
   if (adopted) console.log(`[store] assigned ${adopted} legacy entries to the only account`);
+}
+
+// Remove any plaintext .bak/.tmp stranded by a crash mid atomic-write / migration
+// before we start serving — nothing else reclaims them and a stray .bak can hold
+// the original unencrypted row from a legacy→encrypted rewrite.
+{
+  const dataRoot = fileURLToPath(new URL('../data/', import.meta.url));
+  const cacheRoot = fileURLToPath(new URL('../cache/', import.meta.url));
+  const swept = await sweepOrphanTransients([dataRoot, cacheRoot]).catch((error) => {
+    console.warn('[store] orphan-transient sweep skipped:', error);
+    return 0;
+  });
+  if (swept) console.log(`[store] swept ${swept} orphaned .tmp/.bak file(s)`);
 }
 
 await adoptUnownedLegacyEntries().catch((error) => {

@@ -216,6 +216,8 @@ function installKeys(
 interface RegisterOutcome {
   account: accounts.Account;
   recoveryCode: string;
+  /** Carried out so the caller can bind the issued tokens to these keys. */
+  udk: Buffer;
 }
 
 /** Shared by /auth/register (family type) and /auth/bootstrap. */
@@ -250,7 +252,7 @@ async function registerFamilyAccount(input: {
   const account = updated ?? created.account;
   await ensureUserPerson(account, family.id, fk);
   installKeys(account, created, fk);
-  return { account, recoveryCode: created.recoveryCode };
+  return { account, recoveryCode: created.recoveryCode, udk: created.udk };
 }
 
 async function registerPersonalAccount(input: {
@@ -267,7 +269,7 @@ async function registerPersonalAccount(input: {
   });
   await ensureUserPerson(created.account, created.account.id, created.udk);
   installKeys(created.account, created, undefined);
-  return { account: created.account, recoveryCode: created.recoveryCode };
+  return { account: created.account, recoveryCode: created.recoveryCode, udk: created.udk };
 }
 
 // ---------- registration ----------
@@ -310,7 +312,10 @@ authRoutes.post('/auth/register', ipRateLimit(10), async (c) => {
             first: false,
           })
         : await registerPersonalAccount({ username, password, displayName });
-    const tokens = await accounts.issueTokens(outcome.account);
+    const tokens = await accounts.issueTokens(
+      outcome.account,
+      accounts.sessionBinding(outcome.udk, outcome.account.id, outcome.account.tokenVersion),
+    );
     setRefreshCookie(c, tokens.refreshToken);
     return c.json(
       { ...tokens, user: accounts.toPublic(outcome.account), recoveryCode: outcome.recoveryCode },
@@ -389,7 +394,10 @@ authRoutes.post('/auth/bootstrap', ipRateLimit(10), async (c) => {
     }
   }
 
-  const tokens = await accounts.issueTokens(account);
+  const tokens = await accounts.issueTokens(
+    account,
+    accounts.sessionBinding(outcome.udk, account.id, account.tokenVersion),
+  );
   setRefreshCookie(c, tokens.refreshToken);
   return c.json({
     ...tokens,
@@ -439,7 +447,10 @@ authRoutes.post('/auth/login', ipRateLimit(20), async (c) => {
     installKeys(account, keys, fk);
   }
 
-  const tokens = await accounts.issueTokens(account);
+  const tokens = await accounts.issueTokens(
+    account,
+    keys ? accounts.sessionBinding(keys.udk, account.id, account.tokenVersion) : undefined,
+  );
   setRefreshCookie(c, tokens.refreshToken);
   return c.json({
     ...tokens,
@@ -542,7 +553,10 @@ authRoutes.patch('/auth/me/password', requireAuth, async (c) => {
     const fk = await resolveFamilyKey(updated, keys);
     installKeys(updated, keys, fk);
   }
-  const tokens = await accounts.issueTokens(updated);
+  const tokens = await accounts.issueTokens(
+    updated,
+    keys ? accounts.sessionBinding(keys.udk, updated.id, updated.tokenVersion) : undefined,
+  );
   setRefreshCookie(c, tokens.refreshToken);
   return c.json({ ...tokens, user: accounts.toPublic(updated) });
 });
@@ -621,7 +635,10 @@ authRoutes.post('/auth/recover', ipRateLimit(10), async (c) => {
   installKeys(updated, keys, fk);
   recoverSucceeded(username);
   logRecover(c, username, true);
-  const tokens = await accounts.issueTokens(updated);
+  const tokens = await accounts.issueTokens(
+    updated,
+    accounts.sessionBinding(keys.udk, updated.id, updated.tokenVersion),
+  );
   setRefreshCookie(c, tokens.refreshToken);
   return c.json({
     ...tokens,

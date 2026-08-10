@@ -161,14 +161,17 @@ opsRoutes.get('/accounts', async (c) => {
     const owner = entry.ownerId || entry.userId;
     if (owner) entryCounts.set(owner, (entryCounts.get(owner) ?? 0) + 1);
   }
-  const familyNames = new Map((await families.listFamilies()).map((f) => [f.id, f.name]));
   const items = [];
   for (const account of list) {
     items.push({
       ...accounts.toPublic(account),
-      familyName: account.familyId ? familyNames.get(account.familyId) ?? '' : '',
+      // Deliberately omitted here: the live `unlocked` flag, which would tell an
+      // operator exactly whose keys sit in memory right now — i.e. which session is
+      // worth attacking. The family NAME is dropped from this listing too, though
+      // that is only tidiness for now: data/families/<id>.json still stores it in
+      // the clear and GET /ops/families still returns it. familyId groups accounts
+      // here without naming anyone.
       hasCrypto: accounts.hasCrypto(account),
-      unlocked: !!keyring.getUdk(account.id),
       entryCount: entryCounts.get(account.id) ?? 0,
       storageBytes: await store.ownerStorageBytes(account.id),
       migrationPending: await isMigrationPending(account.id),

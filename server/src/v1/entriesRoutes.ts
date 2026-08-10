@@ -58,6 +58,7 @@ entriesRoutes.get('/entries', async (c) => {
       limit: Number.isFinite(limit) ? limit : undefined,
     },
     udkOf(c),
+    scopeKeyOf(c).scopeKey,
   );
   return c.json(page);
 });
@@ -65,7 +66,7 @@ entriesRoutes.get('/entries', async (c) => {
 entriesRoutes.get('/entries/:id', async (c) => {
   const loaded = await loadOwned(c);
   if (!loaded.ok) return err(c, 'NOT_FOUND', notOwned().message);
-  const full = await store.getEntryDecrypted(loaded.entry.id, udkOf(c));
+  const full = await store.getEntryDecrypted(loaded.entry.id, udkOf(c), scopeKeyOf(c).scopeKey);
   return c.json(full ?? loaded.entry);
 });
 
@@ -119,7 +120,7 @@ entriesRoutes.post('/entries', bodyLimit({
   const override = form.get('override') === '1' || form.get('override') === 'true';
   const result = await store.createEntryIdempotent(meta, imageBuf, thumbBuf, udk, override);
   if (result.kind === 'replay') {
-    const existing = await store.getEntryDecrypted(result.id, udk);
+    const existing = await store.getEntryDecrypted(result.id, udk, scopeKeyOf(c).scopeKey);
     return c.json(existing, 200);
   }
   if (result.kind === 'duplicate')
@@ -152,7 +153,7 @@ entriesRoutes.post('/entries', bodyLimit({
     }
   }
 
-  const stored = await store.getEntryDecrypted(meta.id, udk);
+  const stored = await store.getEntryDecrypted(meta.id, udk, scopeKeyOf(c).scopeKey);
   return c.json(stored ?? meta, 201);
 });
 
@@ -240,8 +241,10 @@ entriesRoutes.get('/entries/:id/depth', async (c) => {
 entriesRoutes.get('/entries/:id/faces', async (c) => {
   const loaded = await loadOwned(c);
   if (!loaded.ok) return err(c, 'NOT_FOUND', notOwned().message);
+  // loadOwned returns the structural view, which no longer carries the refs
+  const faces = await store.readEntryFaces(loaded.entry.id, scopeKeyOf(c).scopeKey);
   return c.json({
-    people: loaded.entry.people,
+    people: faces?.people ?? [],
     unknownFaces: loaded.entry.unknownFaces,
     faceScannedAt: loaded.entry.faceScannedAt,
   });

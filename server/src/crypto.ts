@@ -4,6 +4,7 @@
 import {
   createCipheriv,
   createDecipheriv,
+  createHmac,
   createPrivateKey,
   createPublicKey,
   diffieHellman,
@@ -124,6 +125,21 @@ export function encryptJson(obj: unknown, key: Buffer): Envelope {
 
 export function decryptJson<T>(env: Envelope, key: Buffer): T {
   return JSON.parse(gcmDecrypt(env, key).toString('utf8')) as T;
+}
+
+// ---------- keyed tags ----------
+
+/** Stable, key-bound identifier for a record whose natural key would leak structure
+ *  if it were used as a filename. `nx-tag-v1:<domain>` HKDF-separates this from the
+ *  same key's encryption use, so a tag is a PRF value: unlinkable to `value` without
+ *  the key, yet reproducible for lookups by anyone holding it. 128 bits of output —
+ *  collision-safe at any realistic record count. Tags are key-bound by construction,
+ *  so a key rotation renames every record derived from it (see reencryptScope). */
+export function keyedTag(key: Buffer, domain: string, value: string): string {
+  const sub = Buffer.from(
+    hkdfSync('sha256', key, Buffer.alloc(0), Buffer.from(`nx-tag-v1:${domain}`), KEY_LEN),
+  );
+  return createHmac('sha256', sub).update(value, 'utf8').digest('hex').slice(0, 32);
 }
 
 // ---------- binary blob framing: MAGIC(4) | iv(12) | ciphertext ‖ tag ----------

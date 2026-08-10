@@ -149,6 +149,15 @@ async function encryptScopeData(scopeId: string, scopeKey: Buffer): Promise<void
       .encryptRelationshipRecord(id, scopeKey)
       .catch((e) => console.warn('[deferred] relationship encryption failed', id, e));
   }
+  // Face refs on entries whose content was encrypted before the refs had their own
+  // envelope — the owner-keyed entry migration cannot reach those.
+  const sealed = await store
+    .encryptScopePeople(scopeId, scopeKey)
+    .catch((e) => {
+      console.warn('[deferred] entry face-ref encryption failed', e);
+      return 0;
+    });
+  if (sealed) console.log(`[deferred] sealed face refs on ${sealed} entries in scope ${scopeId}`);
 }
 
 /** Duplicate-name consolidation, once per scope per process (was a boot task). */
@@ -162,8 +171,8 @@ async function consolidateScope(scopeId: string, scopeKey: Buffer): Promise<void
     console.log(`[people] consolidated ${absorbed} duplicate name(s) in scope ${scopeId}`);
     for (const merge of merges) {
       for (const fromId of merge.absorbedIds) {
-        await store.rewritePersonRefs(fromId, merge.keeperId).catch(() => undefined);
-        await relationships.rewriteRelationshipRefs(fromId, merge.keeperId, scopeKey).catch(() => undefined);
+        await store.rewritePersonRefs(fromId, merge.keeperId, scopeKey).catch(() => undefined);
+        await relationships.rewriteRelationshipRefs(fromId, merge.keeperId, scopeId, scopeKey).catch(() => undefined);
       }
     }
     if (!INFERENCE_DISABLED) {

@@ -5,6 +5,7 @@
  *  not-yet-migrated records converges instead of throwing. */
 import * as people from './people.ts';
 import * as relationships from './relationships.ts';
+import * as store from './store.ts';
 
 export async function rotateScopeCiphertext(
   scopeId: string,
@@ -13,6 +14,7 @@ export async function rotateScopeCiphertext(
 ): Promise<void> {
   await people.reencryptScope(scopeId, oldKey, newKey);
   await relationships.reencryptScope(scopeId, oldKey, newKey);
+  await store.reencryptScopePeople(scopeId, oldKey, newKey);
   if (process.env.INFERENCE_DISABLED !== '1') {
     const face = await import('./face.ts').catch(() => null);
     if (face) await face.reencryptScopeCaches(scopeId, oldKey, newKey);

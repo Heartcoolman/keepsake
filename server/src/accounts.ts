@@ -16,6 +16,7 @@ import {
   isEnvelope,
   isSealedBox,
   kdfVersionOf,
+  keyedTag,
   randomKey,
   scryptWith,
   unwrapKey,
@@ -584,6 +585,36 @@ export interface TokenClaims {
   iat: number;
   /** Refresh-token id; rotated on each refresh. */
   jti?: string;
+  /** Session binding — see sessionBinding(). Absent only on tokens minted before
+   *  binding existed, which the refresh path deliberately refuses. */
+  bnd?: string;
+}
+
+/** Proof that whoever holds this token was present when the account's keys were
+ *  unlocked. JWT_SECRET lives in the deployment environment, so anyone holding it
+ *  (the operator) can mint a signature-valid token for any account id read off
+ *  disk. Signature validity alone must therefore NOT be enough to decrypt: data
+ *  routes additionally require this value, derived from the UDK, which is
+ *  recoverable only from the password or the recovery code.
+ *
+ *  `tokenVersion` is mixed in so the binding can be REVOKED. It travels in the
+ *  token's readable payload, so anything that ever sees one token — a proxy log, a
+ *  crash dump, browser storage — learns the value; without a rotation input, that
+ *  one leak would let an operator mint working tokens forever, since the UDK itself
+ *  never changes. Logout, password change and recovery all bump tokenVersion, which
+ *  now moves the expected binding with it. It stays stable across restarts, so an
+ *  unlock alone still revives an existing session without re-issuing tokens. */
+export function sessionBinding(udk: Buffer, accountId: string, tokenVersion: number): string {
+  return keyedTag(udk, 'session-bind', `${accountId}:${Math.floor(tokenVersion) || 0}`);
+}
+
+/** Constant-time check of a presented binding against the live UDK and the
+ *  account's CURRENT token version. */
+export function bindingMatches(presented: unknown, udk: Buffer, account: Account): boolean {
+  if (typeof presented !== 'string' || !presented) return false;
+  const expected = Buffer.from(sessionBinding(udk, account.id, account.tokenVersion), 'utf8');
+  const actual = Buffer.from(presented, 'utf8');
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 /** User-token signing secret; the ops console derives its own domain-separated
@@ -623,7 +654,7 @@ const REFRESH_TTL = 30 * 24 * 60 * 60; // 30d
 /** Exposed for the refresh-token cookie max-age. */
 export const REFRESH_TTL_SECONDS = REFRESH_TTL;
 
-function mintPair(account: Account, refreshJti: string): {
+function mintPair(account: Account, refreshJti: string, bnd?: string): {
   accessToken: string;
   refreshToken: string;
   expiresIn: number;
@@ -636,6 +667,7 @@ function mintPair(account: Account, refreshJti: string): {
     typ: 'access',
     iat,
     exp: iat + ACCESS_TTL,
+    ...(bnd ? { bnd } : {}),
   } satisfies TokenClaims);
   const refreshToken = sign({
     sub: account.id,
@@ -645,12 +677,15 @@ function mintPair(account: Account, refreshJti: string): {
     jti: refreshJti,
     iat,
     exp: iat + REFRESH_TTL,
+    ...(bnd ? { bnd } : {}),
   } satisfies TokenClaims);
   return { accessToken, refreshToken, expiresIn: ACCESS_TTL };
 }
 
-/** Issue tokens and persist a new refresh jti (rotates any prior refresh). */
-export async function issueTokens(account: Account): Promise<{
+/** Issue tokens and persist a new refresh jti (rotates any prior refresh).
+ *  `binding` must be supplied by every caller that holds the unlocked UDK — without
+ *  it the tokens authenticate but cannot open encrypted data (see requireKeys). */
+export async function issueTokens(account: Account, binding?: string): Promise<{
   accessToken: string;
   refreshToken: string;
   expiresIn: number;
@@ -662,16 +697,24 @@ export async function issueTokens(account: Account): Promise<{
     updatedAt: Date.now(),
   }));
   const base = updated ?? { ...account, refreshJti: jti };
-  return mintPair(base, jti);
+  return mintPair(base, jti, binding);
 }
 
 export async function resolveAccessToken(token: string): Promise<Account | null> {
+  return (await resolveAccessSession(token))?.account ?? null;
+}
+
+/** Access-token resolution that also hands back the claims, so key-bearing routes
+ *  can check the session binding the plain account lookup knows nothing about. */
+export async function resolveAccessSession(
+  token: string,
+): Promise<{ account: Account; claims: TokenClaims } | null> {
   const claims = verifyToken(token);
   if (!claims || claims.typ !== 'access') return null;
   const account = await getAccount(claims.sub);
   if (!account || account.disabled) return null;
   if (claims.tv !== account.tokenVersion) return null;
-  return account;
+  return { account, claims };
 }
 
 export async function resolveRefreshToken(token: string): Promise<Account | null> {
@@ -688,13 +731,18 @@ export async function resolveRefreshToken(token: string): Promise<Account | null
   return account;
 }
 
-/** Rotate refresh: validate old token, mint new jti, invalidate previous. */
+/** Rotate refresh: validate old token, mint new jti, invalidate previous.
+ *  The binding rides along unverified — refresh runs without the UDK, and a forged
+ *  binding is caught later by requireKeys. Its mere ABSENCE is refused, though:
+ *  that is a token minted before binding existed, and silently renewing it would
+ *  loop a client between 401s instead of sending it to a password login once. */
 export async function rotateRefreshToken(token: string): Promise<{
   account: Account;
   tokens: { accessToken: string; refreshToken: string; expiresIn: number };
 } | null> {
   const claims = verifyToken(token);
   if (!claims || claims.typ !== 'refresh') return null;
+  if (!claims.bnd) return null;
   return enqueueAccountMutation(async () => {
     const account = await getAccount(claims.sub);
     if (!account || account.disabled) return null;
@@ -709,7 +757,7 @@ export async function rotateRefreshToken(token: string): Promise<{
       updatedAt: Date.now(),
     };
     await putAccount(next);
-    return { account: next, tokens: mintPair(next, jti) };
+    return { account: next, tokens: mintPair(next, jti, claims.bnd) };
   });
 }
 

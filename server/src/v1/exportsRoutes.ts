@@ -34,15 +34,15 @@ exportsRoutes.get('/exports/card/:id', userRateLimit(30), async (c) => {
   const meta = await store.getEntry(id);
   if (!store.isOwnedBy(meta, account.id)) return err(c, 'NOT_FOUND', 'entry not found');
   const udk = keyring.getUdk(account.id)!;
-  const entry = await store.getEntryDecrypted(id, udk);
+  // people names are scope-shared and optional — a member without an FK grant
+  // simply gets a card without the names line (and without the refs to resolve)
+  const scopeKey = keyring.getScopeKey(accounts.scopeIdOf(account));
+  const entry = await store.getEntryDecrypted(id, udk, scopeKey);
   if (!entry) return err(c, 'NOT_FOUND', 'entry not found');
   const photo = await store.readEntryBlob(id, 'img', udk);
   if (!photo) return err(c, 'NOT_FOUND', 'media not found');
 
-  // people names are scope-shared and optional — a member without an FK grant
-  // simply gets a card without the names line
   let peopleLabel = '';
-  const scopeKey = keyring.getScopeKey(accounts.scopeIdOf(account));
   if (scopeKey && entry.people.length) {
     try {
       const names = new Map(

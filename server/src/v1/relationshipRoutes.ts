@@ -57,10 +57,10 @@ relationshipRoutes.get('/graph', async (c) => {
 
 relationshipRoutes.delete('/relationships/:id', requireScopeOwner, async (c) => {
   const account = c.get('account');
-  const id = c.req.param('id');
-  const scope = await relationships.getRelationshipScope(id);
-  if (!scope || scope !== accounts.scopeIdOf(account))
-    return err(c, 'NOT_FOUND', 'relationship not found');
-  const ok = await relationships.deleteRelationship(id);
+  const scopeId = accounts.scopeIdOf(account);
+  const scopeKey = keyring.getScopeKey(scopeId);
+  if (!scopeKey) return err(c, 'E_KEYS_LOCKED', 'unlock required');
+  // The id is the wire pair `<a>__<b>`; only the scope key maps it to a stored record.
+  const ok = await relationships.deleteRelationshipInScope(c.req.param('id'), scopeId, scopeKey);
   return ok ? c.json({ ok: true }) : err(c, 'NOT_FOUND', 'relationship not found');
 });

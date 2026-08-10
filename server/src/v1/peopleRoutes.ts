@@ -195,8 +195,8 @@ peopleRoutes.post('/people/:id/merge', requireScopeOwner, async (c) => {
     return err(c, 'NOT_FOUND', 'person not found');
   const merged = await people.mergePeople(id, fromId, scopeKey);
   if (!merged) return err(c, 'NOT_FOUND', 'person not found');
-  await store.rewritePersonRefs(fromId, id);
-  await relationships.rewriteRelationshipRefs(fromId, id, scopeKey);
+  await store.rewritePersonRefs(fromId, id, scopeKey);
+  await relationships.rewriteRelationshipRefs(fromId, id, scopeId, scopeKey);
   if (merged.templates.length) scheduleRescan(scopeId, scopeKey);
   return c.json(people.toDTO(merged, c.get('account').id));
 });
@@ -213,11 +213,16 @@ peopleRoutes.delete('/people/:id', requireScopeOwner, async (c) => {
   if (!cur || !(await people.deletePerson(id))) return err(c, 'NOT_FOUND', 'person not found');
   // Removing a person can only change entries where they were the assigned winner
   // (runner-up candidates are never persisted), so rescan just those.
-  const affected = (await store.listEntries())
-    .filter((e) => e.people.some((r) => r.personId === id))
-    .map((e) => e.id);
-  await store.rewritePersonRefs(id, undefined);
-  await relationships.rewriteRelationshipRefs(id, undefined, scopeKey);
+  // the refs are scope-keyed, so this asks each entry in the scope rather than
+  // reading the structural view (which no longer carries them)
+  const affected: string[] = [];
+  for (const e of await store.listEntries()) {
+    if (store.entryScopeId(e) !== scopeId) continue;
+    const faces = await store.readEntryFaces(e.id, scopeKey);
+    if (faces?.people.some((r) => r.personId === id)) affected.push(e.id);
+  }
+  await store.rewritePersonRefs(id, undefined, scopeKey);
+  await relationships.rewriteRelationshipRefs(id, undefined, scopeId, scopeKey);
   if (cur.templates.length && affected.length) {
     void import('../face.ts')
       .then((face) => enqueueInference(() => face.rescanEntries(affected, scopeId, scopeKey), { priority: 'batch' }))

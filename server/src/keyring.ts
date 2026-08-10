@@ -1,10 +1,28 @@
 /** In-memory session keyring. Populated whenever the server sees a password
  *  (login / register / unlock / password change); never persisted — a restart
  *  locks all data until members re-enter their passwords (423 E_KEYS_LOCKED).
- *  Sliding TTL matches the refresh-token lifetime; touched on every keyed request. */
+ *  Sliding idle TTL, touched on every keyed request: an active session stays
+ *  unlocked, but keys evict after this much inactivity so the window in which a
+ *  process-memory dump can recover plaintext keys tracks real usage instead of
+ *  the 30-day refresh lifetime. Tune with KEYRING_IDLE_TTL_MS. */
 
-const TTL_MS = 30 * 24 * 3600e3;
+function envTtl(): number {
+  const raw = Math.floor(Number(process.env.KEYRING_IDLE_TTL_MS));
+  // floor at 5 min so a typo can't make every request re-prompt; default 12h idle
+  return Number.isFinite(raw) && raw >= 5 * 60e3 ? raw : 12 * 3600e3;
+}
+const TTL_MS = envTtl();
 const SWEEP_MS = 5 * 60e3;
+
+/** Eviction drops the reference and nothing more. Overwriting the bytes was tried
+ *  and reverted: getUdk/getScopeKey hand out the Buffer BY REFERENCE, and the work
+ *  that holds one longest is detached from any request — deferredTasks.runCatchup
+ *  captures udk/fk for an entire login catchup (per-entry re-encryption, one AI call
+ *  per entry in the relationship backfill) and never calls touch(). Zeroing in place
+ *  turns that job's remaining writes into ciphertext under an all-zero key: data its
+ *  owner can never open again, and that an operator can trivially open. A bounded
+ *  memory-residency window is not worth that risk; the idle TTL below is what limits
+ *  how long keys stay resident. */
 
 interface AccountEntry {
   udk: Buffer;

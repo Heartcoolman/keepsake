@@ -13,11 +13,28 @@ import * as keyring from '../keyring.ts';
 import { randomKey, sealToPub } from '../crypto.ts';
 import { rotateScopeCiphertext } from '../scopeRotation.ts';
 import { err } from './errors.ts';
-import { requireAuth, type AppEnv } from './middleware.ts';
+import { requireKeys, type AppEnv } from './middleware.ts';
 
 export const familyRoutes = new Hono<AppEnv>();
 
-familyRoutes.use('*', requireAuth);
+/** requireKeys, not requireAuth: these routes read the family key straight out of
+ *  the keyring and drive irreversible work with it — creating a family, moving a
+ *  person between scopes, and removing a member, which re-encrypts the whole scope
+ *  under a fresh key. Under plain authentication a token forged with JWT_SECRET
+ *  could trigger all of that against a victim's unlocked session, which is exactly
+ *  what the session binding exists to prevent. Every handler here already needed
+ *  the keys and hand-checked for them, so the only behaviour change is that a
+ *  locked session now gets 423 up front instead of a per-route error.
+ *
+ *  Scoped per path prefix, never `use('*')`: this sub-app is mounted at '/', so a
+ *  blanket matcher would attach to every route registered after it — including
+ *  /entries/changes, which is deliberately requireAuth-only so the feed survives a
+ *  locked keyring (see router.ts). */
+familyRoutes.use('/family', requireKeys);
+familyRoutes.use('/family/*', requireKeys);
+familyRoutes.use('/me/invites', requireKeys);
+familyRoutes.use('/me/invites/*', requireKeys);
+familyRoutes.use('/me/family/*', requireKeys);
 
 const familyBodyLimit = bodyLimit({
   maxSize: 64 * 1024,
@@ -319,7 +336,7 @@ async function removeMember(
   }
 
   // 2. Drop the member's graph edges + perspective labels from the family scope.
-  await relationships.rewriteRelationshipRefs(target.id, undefined, oldFk).catch(() => undefined);
+  await relationships.rewriteRelationshipRefs(target.id, undefined, family.id, oldFk).catch(() => undefined);
   for (const p of await people.listPeople(family.id, oldFk)) {
     if (!p.relations[target.id]) continue;
     await people.updatePerson(p.id, oldFk, (cur) => {

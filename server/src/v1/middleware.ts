@@ -28,17 +28,31 @@ export const requireAdmin: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next();
 };
 
-/** Data routes: auth + this account's keys present in the keyring. After a server
+/** Data routes: auth + this account's keys present in the keyring + a token that
+ *  proves its holder was there when those keys were unlocked. After a server
  *  restart the JWT is still valid but the keyring is empty — 423 tells the client
- *  to re-enter the password (POST /auth/unlock). */
+ *  to re-enter the password (POST /auth/unlock).
+ *
+ *  The binding check is what keeps JWT_SECRET from being enough to read data:
+ *  that secret is deployment configuration, so anyone who can read the environment
+ *  can sign a token for any account id sitting in data/accounts/. Such a token
+ *  passes every signature/version check, and would otherwise be served decrypted
+ *  content off the keyring entry its real owner left behind. The binding is derived
+ *  from the UDK, which the environment and the disk do not yield. */
 export const requireKeys: MiddlewareHandler<AppEnv> = async (c, next) => {
   const header = c.req.header('authorization') ?? '';
   const m = /^Bearer\s+(.+)$/i.exec(header);
   if (!m?.[1]) return err(c, 'UNAUTHORIZED', 'missing bearer token');
-  const account = await accounts.resolveAccessToken(m[1].trim());
-  if (!account) return err(c, 'UNAUTHORIZED', 'invalid or expired token');
+  const session = await accounts.resolveAccessSession(m[1].trim());
+  if (!session) return err(c, 'UNAUTHORIZED', 'invalid or expired token');
+  const { account, claims } = session;
   c.set('account', account);
-  if (!keyring.getUdk(account.id)) return err(c, 'E_KEYS_LOCKED', 'unlock required');
+  const udk = keyring.getUdk(account.id);
+  if (!udk) return err(c, 'E_KEYS_LOCKED', 'unlock required');
+  // Unbound tokens predate this check; 401 sends the client through a password
+  // login, which mints a bound pair. A wrong binding is a forgery.
+  if (!accounts.bindingMatches(claims.bnd, udk, account))
+    return err(c, 'UNAUTHORIZED', 'token not bound to this session; sign in again');
   keyring.touch(account.id);
   await next();
 };

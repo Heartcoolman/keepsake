@@ -1,13 +1,24 @@
-/** File-backed person↔person relationship edges: data/relationships/<a>__<b>.json.
+/** File-backed person↔person relationship edges.
  *  One record per unordered pair; cooccurrence (photo co-appearance) and AI-inferred
  *  evidence share the record. label === '' means cooccurrence-only.
- *  Scoped like people: `scopeId`/`confidence` stay plaintext (confidence drives the
- *  highest-wins comparison), {label, evidence} live in a scope-key envelope. */
+ *
+ *  At rest, an edge reveals nothing but its scope: {a, b, label, confidence, evidence}
+ *  all live in a scope-key envelope, and the file is named by a keyed tag
+ *  (`data/relationships/<tag>.json`) rather than by the pair. The pair id was
+ *  previously the filename, which handed the entire relationship graph — who is
+ *  connected to whom — to anyone who could list the directory, even though the
+ *  labels themselves were encrypted. `scopeId` and the timestamps stay plaintext:
+ *  scope deletion, ops purge and the boot migration must work without any key.
+ *
+ *  The wire shape is unchanged: `Relationship.id` is still `<a>__<b>`, recomputed
+ *  in memory after decryption, so clients (and the virtual-edge overlay in
+ *  relationshipRoutes) see exactly what they saw before. Legacy plaintext rows keep
+ *  their old pair filename until the lazy migration rewrites them under a tag. */
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createKeyedQueue } from './lib/keyedQueue.ts';
 import { writeAtomic } from './lib/atomicFile.ts';
-import { decryptJson, encryptJson, isEnvelope, type Envelope } from './crypto.ts';
+import { decryptJson, encryptJson, isEnvelope, keyedTag, type Envelope } from './crypto.ts';
 import { relationExtractionPrompt } from './prompts.ts';
 import { xaiChat } from './xai.ts';
 import * as people from './people.ts';
@@ -40,16 +51,30 @@ const WRITE_BACK_MIN = 0.6;
 const WRITE_BACK_OVERWRITE = 0.85;
 const MOCK = process.env.MOCK_AI === '1';
 
-interface StoredRelationship {
-  id: string;
+/** The sensitive half of an edge — everything that describes the connection. */
+interface RelationContent {
   a: string;
   b: string;
-  scopeId: string;
+  label: string;
   confidence: number;
+  evidence: RelationEvidence[];
+}
+
+/** On-disk record. `storageId` is the filename stem: a keyed tag for records in the
+ *  current shape, the plaintext pair id for anything not migrated yet — which is
+ *  also how migration status is detected, since a tag can never contain '__'. */
+interface StoredRelationship {
+  storageId: string;
+  scopeId: string;
   createdAt: number;
   updatedAt: number;
   enc: Envelope | null;
-  legacy: { label: string; evidence: RelationEvidence[] } | null;
+  legacy: RelationContent | null;
+  /** The shape that shipped before the endpoints moved inside: `{label, evidence}`
+   *  in the envelope, with `a`/`b`/`confidence` beside it in the clear. Those outer
+   *  fields are the only copy of the endpoints such a row has, so they are kept to
+   *  complete the decrypted content until the row is rewritten. */
+  outerEndpoints: { a: string; b: string; confidence: number } | null;
 }
 
 let index: Map<string, StoredRelationship> | null = null;
@@ -60,6 +85,36 @@ const pairId = (x: string, y: string): string => {
   const [a, b] = [x, y].sort();
   return `${a}__${b}`;
 };
+
+/** Filename for an encrypted edge. Key-bound: rotating the scope key renames the
+ *  record, which is why reencryptScope has to move the file rather than rewrite it. */
+const pairTag = (key: Buffer, pair: string): string => keyedTag(key, 'relationship', pair);
+
+/** Lock both slots a record can occupy (its current name and its destination tag)
+ *  in a stable order, so a rewrite that relocates a row cannot race a concurrent
+ *  encrypt/delete on either name. Same nested-lock idiom as people.mergePeople.
+ *  When the two coincide — a rotation replay where the row already sits at its
+ *  destination — the lock is taken once: re-entering the same key would deadlock
+ *  against the outer hold, which is the queue's whole point. */
+function enqueuePair<T>(a: string, b: string, task: () => Promise<T>): Promise<T> {
+  return enqueueAll([a, b], task);
+}
+
+/** Lock every storage location a task will read or write, deduplicated and in a
+ *  stable order. Whatever the task might reach must be in here: a name that is read
+ *  but not held can be deleted between the read and the write, which silently
+ *  resurrects the deleted record. */
+function enqueueAll<T>(keys: string[], task: () => Promise<T>): Promise<T> {
+  const ordered = [...new Set(keys)].sort();
+  return ordered.reduceRight<() => Promise<T>>(
+    (next, key) => () => enqueue(key, next),
+    task,
+  )();
+}
+
+function numOr(v: unknown, fallback: number): number {
+  return Number.isFinite(Number(v)) ? Number(v) : fallback;
+}
 
 function normalizeEvidence(raw: unknown): RelationEvidence[] {
   return Array.isArray(raw)
@@ -79,7 +134,9 @@ function normalizeEvidence(raw: unknown): RelationEvidence[] {
     : [];
 }
 
-function normalizeRelationship(raw: unknown): Relationship | null {
+/** Validate the sensitive half. Returns null when the endpoints are unusable —
+ *  which is also what rejects a corrupt or wrong-key decryption. */
+function normalizeContent(raw: unknown): RelationContent | null {
   if (!raw || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
   if (typeof value.a !== 'string' || !ID_RE.test(value.a)) return null;
@@ -88,101 +145,129 @@ function normalizeRelationship(raw: unknown): Relationship | null {
   const [a, b] = [value.a, value.b].sort() as [string, string];
   const confidence = Number(value.confidence);
   return {
-    id: `${a}__${b}`,
     a,
     b,
-    scopeId: typeof value.scopeId === 'string' && ID_RE.test(value.scopeId) ? value.scopeId : '',
     label: typeof value.label === 'string' ? value.label.trim().slice(0, MAX_LABEL) : '',
     confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0,
     evidence: normalizeEvidence(value.evidence),
-    createdAt: Number.isFinite(Number(value.createdAt)) ? Number(value.createdAt) : Date.now(),
-    updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : Date.now(),
   };
 }
 
-function parseStored(raw: unknown): StoredRelationship | null {
+function normalizeRelationship(raw: unknown): Relationship | null {
+  const content = normalizeContent(raw);
+  if (!content) return null;
+  const value = raw as Record<string, unknown>;
+  const now = Date.now();
+  return {
+    id: pairId(content.a, content.b),
+    ...content,
+    scopeId: typeof value.scopeId === 'string' && ID_RE.test(value.scopeId) ? value.scopeId : '',
+    createdAt: numOr(value.createdAt, now),
+    updatedAt: numOr(value.updatedAt, now),
+  };
+}
+
+function parseStored(storageId: string, raw: unknown): StoredRelationship | null {
   if (!raw || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
+  const now = Date.now();
+  const scopeId =
+    typeof value.scopeId === 'string' && ID_RE.test(value.scopeId) ? value.scopeId : '';
+  const base = {
+    storageId,
+    scopeId,
+    createdAt: numOr(value.createdAt, now),
+    updatedAt: numOr(value.updatedAt, now),
+  };
   if (isEnvelope(value.enc)) {
-    const shell = normalizeRelationship({ ...value, label: 'x', evidence: [] });
-    if (!shell) return null;
+    const outer = normalizeContent(value);
     return {
-      id: shell.id,
-      a: shell.a,
-      b: shell.b,
-      scopeId: shell.scopeId,
-      confidence: shell.confidence,
-      createdAt: shell.createdAt,
-      updatedAt: shell.updatedAt,
+      ...base,
       enc: value.enc,
       legacy: null,
+      outerEndpoints: outer ? { a: outer.a, b: outer.b, confidence: outer.confidence } : null,
     };
   }
-  const full = normalizeRelationship(value);
-  if (!full) return null;
-  return {
-    id: full.id,
-    a: full.a,
-    b: full.b,
-    scopeId: full.scopeId,
-    confidence: full.confidence,
-    createdAt: full.createdAt,
-    updatedAt: full.updatedAt,
-    enc: null,
-    legacy: { label: full.label, evidence: full.evidence },
-  };
+  const legacy = normalizeContent(value);
+  if (!legacy) return null;
+  return { ...base, enc: null, legacy, outerEndpoints: null };
 }
 
 function decryptStored(stored: StoredRelationship, key: Buffer | undefined): Relationship {
-  let content: { label: string; evidence: RelationEvidence[] };
+  let content: RelationContent;
   if (stored.legacy) {
     content = stored.legacy;
   } else {
     if (!key) throw Object.assign(new Error('relationship content locked'), { status: 423 });
     const raw = decryptJson<Record<string, unknown>>(stored.enc!, key);
-    content = {
-      label: typeof raw.label === 'string' ? raw.label.trim().slice(0, MAX_LABEL) : '',
-      evidence: normalizeEvidence(raw.evidence),
-    };
+    // Pre-migration envelopes hold only {label, evidence}; their endpoints are the
+    // outer plaintext fields, so completing the record needs both halves.
+    const normalized =
+      normalizeContent(raw) ??
+      (stored.outerEndpoints ? normalizeContent({ ...raw, ...stored.outerEndpoints }) : null);
+    if (!normalized) throw new Error('corrupt relationship content');
+    content = normalized;
   }
   return {
-    id: stored.id,
-    a: stored.a,
-    b: stored.b,
+    id: pairId(content.a, content.b),
+    ...content,
     scopeId: stored.scopeId,
-    confidence: stored.confidence,
     createdAt: stored.createdAt,
     updatedAt: stored.updatedAt,
-    ...content,
   };
 }
 
-function toStored(r: Relationship, key: Buffer): StoredRelationship {
+function toStored(storageId: string, r: Relationship, key: Buffer): StoredRelationship {
   return {
-    id: r.id,
-    a: r.a,
-    b: r.b,
+    storageId,
     scopeId: r.scopeId,
-    confidence: r.confidence,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
-    enc: encryptJson({ label: r.label, evidence: r.evidence }, key),
+    enc: encryptJson(
+      { a: r.a, b: r.b, label: r.label, confidence: r.confidence, evidence: r.evidence },
+      key,
+    ),
     legacy: null,
+    outerEndpoints: null,
   };
 }
 
+/** A record still carrying its endpoints in the filename — plaintext row or the
+ *  earlier envelope shape. Tags are hex, so '__' marks exactly the un-migrated ones. */
+const needsMigration = (stored: StoredRelationship): boolean => stored.storageId.includes('__');
+
 function diskJson(stored: StoredRelationship): string {
-  const { legacy, ...rest } = stored;
-  if (legacy) {
-    const { enc: _enc, ...structural } = rest;
-    return JSON.stringify({ ...structural, ...legacy });
-  }
-  return JSON.stringify(rest);
+  const base = {
+    scopeId: stored.scopeId,
+    createdAt: stored.createdAt,
+    updatedAt: stored.updatedAt,
+  };
+  // Un-migrated rows keep their original inline shape until the lazy migration
+  // runs: for the earlier envelope shape that means preserving the outer endpoints,
+  // which are its ONLY copy — writing the new shape over them would leave an
+  // envelope whose {label, evidence} can never be tied back to a pair again.
+  if (stored.legacy) return JSON.stringify({ id: stored.storageId, ...stored.legacy, ...base });
+  return JSON.stringify({ ...base, ...(stored.outerEndpoints ?? {}), enc: stored.enc });
 }
 
 async function writeStoredAtomic(stored: StoredRelationship): Promise<void> {
   await mkdir(DIR, { recursive: true });
-  await writeAtomic(DIR + stored.id + '.json', diskJson(stored));
+  await writeAtomic(DIR + stored.storageId + '.json', diskJson(stored));
+}
+
+/** Replace a record's file when its storage id changed (legacy→tag, or a rotation
+ *  that re-derives the tag). Writes the new file first so a crash cannot lose the
+ *  edge — at worst it leaves a stale copy the next pass overwrites. */
+async function relocate(
+  map: Map<string, StoredRelationship>,
+  fromId: string,
+  stored: StoredRelationship,
+): Promise<void> {
+  await writeStoredAtomic(stored);
+  map.set(stored.storageId, stored);
+  if (fromId === stored.storageId) return;
+  await rm(DIR + fromId + '.json', { force: true });
+  map.delete(fromId);
 }
 
 async function load(): Promise<Map<string, StoredRelationship>> {
@@ -193,10 +278,11 @@ async function load(): Promise<Map<string, StoredRelationship>> {
       const map = new Map<string, StoredRelationship>();
       for (const f of await readdir(DIR)) {
         if (!f.endsWith('.json')) continue;
+        const storageId = f.slice(0, -'.json'.length);
         try {
-          const r = parseStored(JSON.parse(await readFile(DIR + f, 'utf8')));
+          const r = parseStored(storageId, JSON.parse(await readFile(DIR + f, 'utf8')));
           if (!r) throw new Error('invalid relationship');
-          map.set(r.id, r);
+          map.set(r.storageId, r);
         } catch {
           console.warn('[relationships] skipping corrupt relationship', f);
         }
@@ -214,90 +300,146 @@ async function load(): Promise<Map<string, StoredRelationship>> {
 }
 
 export async function listRelationships(scopeId: string, key: Buffer | undefined): Promise<Relationship[]> {
-  return [...(await load()).values()]
+  const out: Relationship[] = [];
+  for (const stored of [...(await load()).values()]
     .filter((r) => r.scopeId === scopeId)
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .map((r) => decryptStored(r, key));
+    .sort((a, b) => a.createdAt - b.createdAt)) {
+    try {
+      out.push(decryptStored(stored, key));
+    } catch (e) {
+      // One unreadable edge must not take the whole graph down with it — the old
+      // shape failed closed at load time, per file; keep that blast radius.
+      console.warn('[relationships] skipping unreadable edge', stored.storageId, e);
+    }
+  }
+  return out;
 }
 
+/** Ids of records not yet in the current at-rest shape — plaintext rows AND rows
+ *  whose envelope predates the endpoints moving inside. Both are still named by
+ *  their pair, which is the leak the migration exists to close. */
 export async function listLegacyRelationshipIds(scopeId?: string): Promise<string[]> {
   return [...(await load()).values()]
-    .filter((r) => !!r.legacy && (!scopeId || r.scopeId === scopeId))
-    .map((r) => r.id);
+    .filter((r) => needsMigration(r) && (!scopeId || r.scopeId === scopeId))
+    .map((r) => r.storageId);
 }
 
-/** Structural scope check without a key (used by the scoped delete route). */
-export async function getRelationshipScope(id: string): Promise<string | undefined> {
-  return (await load()).get(id)?.scopeId;
+/** Structural scope check by storage id, without a key (boot migration). */
+export async function getRelationshipScope(storageId: string): Promise<string | undefined> {
+  return (await load()).get(storageId)?.scopeId;
 }
 
-export async function deleteRelationship(id: string): Promise<boolean> {
-  return enqueue(id, async () => {
+/** Internal primitive: delete by storage id (scope-wide purges own the check). */
+export async function deleteRelationship(storageId: string): Promise<boolean> {
+  return enqueue(storageId, async () => {
     const map = await load();
-    if (!map.has(id)) return false;
-    await rm(DIR + id + '.json', { force: true });
-    map.delete(id);
+    if (!map.has(storageId)) return false;
+    await rm(DIR + storageId + '.json', { force: true });
+    map.delete(storageId);
     return true;
   });
+}
+
+/** Delete by the wire id (`<a>__<b>`) a client holds. The pair only names a file
+ *  through the scope key, so resolving it is itself the proof of scope membership;
+ *  the explicit scopeId check stays as the authorization gate. */
+export async function deleteRelationshipInScope(
+  wireId: string,
+  scopeId: string,
+  key: Buffer,
+): Promise<boolean> {
+  const map = await load();
+  const tag = pairTag(key, wireId);
+  const stored = map.get(tag) ?? map.get(wireId);
+  if (!stored || stored.scopeId !== scopeId) return false;
+  return deleteRelationship(stored.storageId);
 }
 
 /** Ops purge / family dissolution: remove every edge in a scope (no key needed). */
 export async function deleteScopeData(scopeId: string): Promise<number> {
   let removed = 0;
   for (const r of [...(await load()).values()].filter((r) => r.scopeId === scopeId)) {
-    if (await deleteRelationship(r.id)) removed++;
+    if (await deleteRelationship(r.storageId)) removed++;
   }
   return removed;
 }
 
 /** Assign a scope to a legacy row without touching its plaintext content. */
-export async function assignScope(id: string, scopeId: string): Promise<void> {
-  await enqueue(id, async () => {
+export async function assignScope(storageId: string, scopeId: string): Promise<void> {
+  await enqueue(storageId, async () => {
     const map = await load();
-    const current = map.get(id);
+    const current = map.get(storageId);
     if (!current || current.scopeId === scopeId) return;
     const next: StoredRelationship = { ...current, scopeId };
     await writeStoredAtomic(next);
-    map.set(id, next);
+    map.set(storageId, next);
   });
 }
 
-/** Lazy at-rest migration of one legacy row. */
-export async function encryptRelationshipRecord(id: string, key: Buffer): Promise<boolean> {
-  return enqueue(id, async () => {
-    const map = await load();
-    const current = map.get(id);
-    if (!current?.legacy) return false;
-    const stored = toStored(decryptStored(current, undefined), key);
-    await writeStoredAtomic(stored);
-    map.set(id, stored);
+/** Lazy at-rest migration of one un-migrated row — plaintext, or the earlier
+ *  envelope shape — into the current one: endpoints sealed inside, file renamed to
+ *  its keyed tag. */
+export async function encryptRelationshipRecord(storageId: string, key: Buffer): Promise<boolean> {
+  const map = await load();
+  const peek = map.get(storageId);
+  if (!peek || !needsMigration(peek)) return false;
+  const tag = pairTag(key, decryptStored(peek, key).id);
+  return enqueuePair(tag, storageId, async () => {
+    const current = map.get(storageId);
+    if (!current || !needsMigration(current)) return false;
+    await relocate(map, storageId, toStored(tag, decryptStored(current, key), key));
     return true;
   });
 }
 
-/** Re-encrypt every record in a scope under a new key (family-key rotation). */
-/** Re-key every relationship in a scope. Destination key first so an interrupted
- *  rotation can be resumed over records it already converted (see people.ts). */
+/** Re-key every relationship in a scope. Both the envelope and the filename are
+ *  key-bound, so each record is rewritten under its new tag and the old file
+ *  removed. Resumable: the destination key is tried first, so a pass that died
+ *  partway converges when re-run over its mix of converted and unconverted rows. */
 export async function reencryptScope(scopeId: string, oldKey: Buffer, newKey: Buffer): Promise<void> {
-  for (const id of [...(await load()).values()].filter((r) => r.scopeId === scopeId).map((r) => r.id)) {
-    await enqueue(id, async () => {
-      const map = await load();
-      const current = map.get(id);
-      if (!current || current.scopeId !== scopeId) return;
-      let pair;
+  for (const storageId of [...(await load()).values()]
+    .filter((r) => r.scopeId === scopeId)
+    .map((r) => r.storageId)) {
+    const map = await load();
+    const peek = map.get(storageId);
+    if (!peek || peek.scopeId !== scopeId) continue;
+    let pair: Relationship;
+    try {
+      pair = decryptStored(peek, newKey);
+    } catch {
       try {
-        pair = decryptStored(current, newKey);
+        pair = decryptStored(peek, oldKey);
       } catch {
-        pair = decryptStored(current, oldKey);
+        console.warn('[relationships] skipping edge that matches neither key', storageId);
+        continue;
       }
-      const stored = toStored(pair, newKey);
-      await writeStoredAtomic(stored);
-      map.set(id, stored);
+    }
+    const tag = pairTag(newKey, pair.id);
+    await enqueuePair(tag, storageId, async () => {
+      const current = map.get(storageId);
+      if (!current || current.scopeId !== scopeId) return;
+      let fresh: Relationship;
+      try {
+        fresh = decryptStored(current, newKey);
+      } catch {
+        try {
+          fresh = decryptStored(current, oldKey);
+        } catch {
+          // Neither key opens it. Skipping keeps the rest of the scope rotating —
+          // an escaping throw would abort the pass and re-abort it identically on
+          // every later attempt, stranding every record ordered after this one.
+          console.warn('[relationships] skipping edge that matches neither key', storageId);
+          return;
+        }
+      }
+      await relocate(map, storageId, toStored(tag, fresh, newKey));
     });
   }
 }
 
-/** Read-modify-write one pair record under its lock; creates the record when absent. */
+/** Read-modify-write one pair record under its lock; creates the record when absent.
+ *  A still-unmigrated legacy row for the same pair is adopted and removed in the
+ *  same critical section, so an edge can never end up stored twice. */
 async function upsertPair(
   x: string,
   y: string,
@@ -305,22 +447,21 @@ async function upsertPair(
   key: Buffer,
   mutate: (cur: Relationship) => Relationship | null,
 ): Promise<void> {
-  const id = pairId(x, y);
-  await enqueue(id, async () => {
+  const pair = pairId(x, y);
+  const tag = pairTag(key, pair);
+  await enqueuePair(tag, pair, async () => {
     const map = await load();
     const now = Date.now();
     const [a, b] = [x, y].sort() as [string, string];
-    const existing = map.get(id);
+    const existing = map.get(tag) ?? map.get(pair);
     const cur: Relationship = existing
       ? decryptStored(existing, key)
-      : { id, a, b, scopeId, label: '', confidence: 0, evidence: [], createdAt: now, updatedAt: now };
+      : { id: pair, a, b, scopeId, label: '', confidence: 0, evidence: [], createdAt: now, updatedAt: now };
     const mutated = mutate(cur);
     if (!mutated) return;
     const next = normalizeRelationship({ ...mutated, scopeId });
-    if (!next || next.id !== id) throw new Error('invalid relationship update');
-    const stored = toStored(next, key);
-    await writeStoredAtomic(stored);
-    map.set(id, stored);
+    if (!next || next.id !== pair) throw new Error('invalid relationship update');
+    await relocate(map, existing?.storageId ?? tag, toStored(tag, next, key));
   });
 }
 
@@ -369,33 +510,49 @@ export async function upsertAiRelation(
 
 const evidenceKey = (e: RelationEvidence): string => `${e.entryId} ${e.kind}`;
 
-/** Keep edges consistent when a person is merged (targetId set) or deleted. */
+/** Keep edges consistent when a person is merged (targetId set) or deleted.
+ *  Endpoints live inside the envelope now, so the scope's records are decrypted to
+ *  find the ones that touch `fromId` — hence the explicit scopeId. */
 export async function rewriteRelationshipRefs(
   fromId: string,
   targetId: string | undefined,
+  scopeId: string,
   key: Buffer,
 ): Promise<void> {
   const map = await load();
-  const touched = [...map.values()].filter((r) => r.a === fromId || r.b === fromId);
-  for (const r of touched) {
+  const touched: { storageId: string; rel: Relationship }[] = [];
+  for (const stored of map.values()) {
+    if (stored.scopeId !== scopeId) continue;
+    let rel: Relationship;
+    try {
+      rel = decryptStored(stored, key);
+    } catch {
+      continue; // wrong key or corrupt — leave it for the rotation pass
+    }
+    if (rel.a === fromId || rel.b === fromId) touched.push({ storageId: stored.storageId, rel });
+  }
+
+  for (const { storageId, rel } of touched) {
     if (!targetId) {
-      await deleteRelationship(r.id);
+      await deleteRelationship(storageId);
       continue;
     }
-    const other = r.a === fromId ? r.b : r.a;
+    const other = rel.a === fromId ? rel.b : rel.a;
     if (other === targetId) {
       // merging both endpoints into one person — a self-pair is meaningless
-      await deleteRelationship(r.id);
+      await deleteRelationship(storageId);
       continue;
     }
-    const newId = pairId(targetId, other);
-    // stable lock order across both pair keys, same trick as people.mergePeople
-    const [first, second] = [r.id, newId].sort() as [string, string];
-    await enqueue(first, () => enqueue(second, async () => {
-      const oldStored = map.get(r.id);
+    const newPair = pairId(targetId, other);
+    const newTag = pairTag(key, newPair);
+    // All three names this touches: the source record, and BOTH places the
+    // destination pair can live (its keyed tag, and its un-migrated pair filename,
+    // which the merge below reads to fold in existing evidence).
+    await enqueueAll([newTag, newPair, storageId], async () => {
+      const oldStored = map.get(storageId);
       if (!oldStored) return;
       const old = decryptStored(oldStored, key);
-      const existingStored = map.get(newId);
+      const existingStored = map.get(newTag) ?? map.get(newPair);
       const existing = existingStored ? decryptStored(existingStored, key) : undefined;
       const seen = new Set((existing?.evidence ?? []).map(evidenceKey));
       const evidence = [
@@ -407,7 +564,6 @@ export async function rewriteRelationshipRefs(
       const fromOld = old.confidence >= (existing?.confidence ?? 0);
       const [a, b] = [targetId, other].sort() as [string, string];
       const next = normalizeRelationship({
-        id: newId,
         a,
         b,
         scopeId: old.scopeId,
@@ -418,12 +574,12 @@ export async function rewriteRelationshipRefs(
         updatedAt: Date.now(),
       });
       if (!next) return;
-      const stored = toStored(next, key);
-      await writeStoredAtomic(stored);
-      await rm(DIR + old.id + '.json', { force: true });
-      map.set(newId, stored);
-      map.delete(old.id);
-    }));
+      await relocate(map, existingStored?.storageId ?? newTag, toStored(newTag, next, key));
+      if (storageId !== newTag) {
+        await rm(DIR + storageId + '.json', { force: true });
+        map.delete(storageId);
+      }
+    });
   }
 }
 
@@ -549,7 +705,7 @@ export async function backfillForOwner(
   scopeKey: Buffer,
   udk: Buffer,
 ): Promise<void> {
-  const pending = (await store.listEntriesFor(ownerId, udk))
+  const pending = (await store.listEntriesFor(ownerId, udk, scopeKey))
     .filter((e) => !e.relationScannedAt && e.status === 'done' && e.diaryText.trim());
   if (!pending.length) return;
   console.log(`[relationships] backfilling ${pending.length} entries for ${ownerId}`);

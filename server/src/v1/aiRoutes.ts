@@ -70,9 +70,11 @@ async function loadOwnedEntry(
   id: string,
   userId: string,
   udk: Buffer,
+  scopeKey: Buffer | undefined,
 ): Promise<store.EntryMeta | undefined> {
   if (!store.validId(id)) return undefined;
-  const entry = await store.getEntryDecrypted(id, udk);
+  // scopeKey: the scene prompt names the people in the photo, so the refs are needed
+  const entry = await store.getEntryDecrypted(id, udk, scopeKey);
   return store.isOwnedBy(entry, userId) ? entry : undefined;
 }
 
@@ -124,7 +126,7 @@ aiRoutes.post('/entries/:id/analyze', async (c) => {
   const userId = c.get('account').id;
   const keys = routeKeysOf(c.get('account'));
   if (!keys) return err(c, 'E_KEYS_LOCKED', 'unlock required');
-  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk);
+  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk, keys.scopeKey);
   if (!entry) return err(c, 'NOT_FOUND', 'entry not found');
   const body = await c.req.json<{ force?: unknown }>().catch(() => ({ force: false }));
   const force = body.force === true;
@@ -138,7 +140,8 @@ aiRoutes.post('/entries/:id/analyze', async (c) => {
     if (process.env.INFERENCE_DISABLED === '1') throw new Error('inference disabled');
     const face = await import('../face.ts');
     await enqueueInference(() => face.scanEntry(entry.id, imageBuf, keys.scopeId, keys.scopeKey));
-    const refreshed = await store.getEntry(entry.id);
+    // face refs live in the scope envelope now — the structural view has none
+    const refreshed = await store.readEntryFaces(entry.id, keys.scopeKey);
     if (refreshed) {
       const registry = await people.listPeople(keys.scopeId, keys.scopeKey);
       const pairs = refreshed.people
@@ -147,7 +150,7 @@ aiRoutes.post('/entries/:id/analyze', async (c) => {
       const labels = positionLabels(pairs.map((x) => ({ cx: x.r.cx })));
       const known = pairs.map((x, i) => ({
         name: x.p.name,
-        relation: people.relationFor(x.p, refreshed.ownerId || refreshed.userId),
+        relation: people.relationFor(x.p, entry.ownerId || entry.userId),
         ...(labels[i] ? { pos: labels[i] } : {}),
       }));
       peopleCtx = { known, unknownCount: refreshed.unknownFaces };
@@ -243,7 +246,7 @@ aiRoutes.post('/entries/:id/chat', aiBodyLimit, async (c) => {
   const userId = c.get('account').id;
   const keys = routeKeysOf(c.get('account'));
   if (!keys) return err(c, 'E_KEYS_LOCKED', 'unlock required');
-  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk);
+  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk, keys.scopeKey);
   if (!entry) return err(c, 'NOT_FOUND', 'entry not found');
   const body = await c.req.json<{ messages?: unknown }>();
   if (!validMessages(body.messages)) return err(c, 'VALIDATION', 'messages required');
@@ -304,7 +307,7 @@ aiRoutes.post('/entries/:id/diary', aiBodyLimit, async (c) => {
   const userId = c.get('account').id;
   const keys = routeKeysOf(c.get('account'));
   if (!keys) return err(c, 'E_KEYS_LOCKED', 'unlock required');
-  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk);
+  const entry = await loadOwnedEntry(c.req.param('id'), userId, keys.udk, keys.scopeKey);
   if (!entry) return err(c, 'NOT_FOUND', 'entry not found');
   const body = await c.req.json<{
     messages?: unknown;
@@ -400,7 +403,8 @@ aiRoutes.post('/monthly/:yearMonth/generate', async (c) => {
   const userId = c.get('account').id;
   const udk = keyring.getUdk(userId)!;
   if (!store.validYearMonth(ym)) return err(c, 'VALIDATION', 'bad yearMonth');
-  const monthEntries = (await store.listEntriesFor(userId, udk))
+  // no scope key: the monthly review is written from diary text only
+  const monthEntries = (await store.listEntriesFor(userId, udk, undefined))
     .filter((e) => e.yearMonth === ym && e.status === 'done')
     .sort((a, b) => a.createdAt - b.createdAt);
   if (!monthEntries.length) return err(c, 'VALIDATION', 'no entries this month');

@@ -123,7 +123,7 @@ export interface AnnualProgress {
 
 /** Collect the year's entries — the cheap pre-check routes use before streaming. */
 export async function yearEntries(source: AnnualSource): Promise<store.EntryMeta[]> {
-  const all = await store.listEntriesFor(source.accountId, source.udk);
+  const all = await store.listEntriesFor(source.accountId, source.udk, source.scopeKey);
   return all
     .filter((e) => e.yearMonth.startsWith(`${source.year}-`))
     .sort((a, b) => a.takenAt - b.takenAt);

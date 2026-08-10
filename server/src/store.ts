@@ -107,10 +107,19 @@ const MAX_CHAT_MESSAGES = 64;
 const MAX_CHAT_CONTENT = 4000;
 const MAX_TEXT = 20_000;
 
-/** On-disk / in-memory record: meta has EMPTY content fields when `enc` is set. */
+/** On-disk / in-memory record: meta has EMPTY content fields when `enc` is set,
+ *  and an EMPTY people[] when `encPeople` is set.
+ *
+ *  Face refs live in their own envelope under the SCOPE key rather than inside
+ *  `enc`, because the two are written by different holders: entry content is the
+ *  owner's (UDK), while a face scan re-matches a whole family's photos against the
+ *  shared registry and only ever has the scope key. They are separated at rest for
+ *  the same reason relationship endpoints are: {personId, faceIndex, cx} per entry
+ *  is the co-occurrence graph — who appears in which photo, and where in frame. */
 interface StoredEntry {
   meta: EntryMeta;
   enc: Envelope | null;
+  encPeople: Envelope | null;
 }
 
 let index: Map<string, StoredEntry> | null = null;
@@ -230,21 +239,45 @@ function blankContent(meta: EntryMeta): EntryMeta {
   return { ...meta, title: '', mood: '', diaryText: '', imageDescription: '', chat: [] };
 }
 
-function toStored(full: EntryMeta, udk: Buffer): StoredEntry {
-  return { meta: blankContent(full), enc: encryptJson(pickContent(full), udk) };
+const blankPeople = (meta: EntryMeta): EntryMeta => ({ ...meta, people: [] });
+
+/** Strip whatever is held in an envelope, so the in-memory index and the on-disk
+ *  structural fields never carry a decrypted copy. */
+function toStructural(meta: EntryMeta, enc: Envelope | null, encPeople: Envelope | null): EntryMeta {
+  let out = meta;
+  if (enc) out = blankContent(out);
+  if (encPeople) out = blankPeople(out);
+  return out;
+}
+
+/** `encPeople` is carried, never re-derived: content writers hold the owner UDK
+ *  and usually cannot open (or even see) the scope-keyed face refs. */
+function toStored(full: EntryMeta, udk: Buffer, encPeople: Envelope | null): StoredEntry {
+  const enc = encryptJson(pickContent(full), udk);
+  return { meta: toStructural(full, enc, encPeople), enc, encPeople };
 }
 
 function diskJson(stored: StoredEntry): string {
-  if (!stored.enc) return JSON.stringify(stored.meta);
-  const { title: _t, mood: _m, diaryText: _d, imageDescription: _i, chat: _c, ...structural } =
-    stored.meta;
-  return JSON.stringify({ ...structural, enc: stored.enc });
+  const {
+    title,
+    mood,
+    diaryText,
+    imageDescription,
+    chat,
+    people,
+    ...structural
+  } = stored.meta;
+  return JSON.stringify({
+    ...structural,
+    ...(stored.enc ? { enc: stored.enc } : { title, mood, diaryText, imageDescription, chat }),
+    ...(stored.encPeople ? { encPeople: stored.encPeople } : { people }),
+  });
 }
 
 function parseStored(raw: Record<string, unknown>): StoredEntry {
   const enc = isEnvelope(raw.enc) ? raw.enc : null;
-  const meta = sanitizeMeta(raw);
-  return enc ? { meta: blankContent(meta), enc } : { meta, enc: null };
+  const encPeople = isEnvelope(raw.encPeople) ? raw.encPeople : null;
+  return { meta: toStructural(sanitizeMeta(raw), enc, encPeople), enc, encPeople };
 }
 
 class KeysMissingError extends Error {
@@ -254,12 +287,33 @@ class KeysMissingError extends Error {
   }
 }
 
-/** Full meta with content. Legacy rows need no key; encrypted rows need the owner UDK. */
-function decryptStored(stored: StoredEntry, udk: Buffer | undefined): EntryMeta {
-  if (!stored.enc) return stored.meta;
-  if (!udk) throw new KeysMissingError();
-  const content = decryptJson<EntryContent>(stored.enc, udk);
-  return sanitizeMeta({ ...stored.meta, ...content });
+/** Full meta. Legacy rows need no key; encrypted content needs the owner UDK and
+ *  encrypted face refs need the scope key. A missing scope key is NOT an error —
+ *  most readers do not care about people[], and it stays empty for them. */
+function decryptStored(
+  stored: StoredEntry,
+  udk: Buffer | undefined,
+  scopeKey: Buffer | undefined,
+): EntryMeta {
+  let meta = stored.meta;
+  if (stored.enc) {
+    if (!udk) throw new KeysMissingError();
+    meta = sanitizeMeta({ ...meta, ...decryptJson<EntryContent>(stored.enc, udk) });
+  }
+  if (stored.encPeople && scopeKey) {
+    // Degrade to "no refs" rather than throwing, matching readEntryFaces/readPeople.
+    // A family-key rotation re-keys people and relationships before entries, so for
+    // that window a member legitimately holds the new key while these refs are still
+    // under the old one — throwing here would 500 their whole timeline over a field
+    // that is only decoration on it.
+    try {
+      const { people } = decryptJson<{ people: PersonRef[] }>(stored.encPeople, scopeKey);
+      meta = sanitizeMeta({ ...meta, people });
+    } catch {
+      meta = blankPeople(meta);
+    }
+  }
+  return meta;
 }
 
 function encodeCursor(takenAt: number, id: string): string {
@@ -447,12 +501,17 @@ export async function listEntries(): Promise<EntryMeta[]> {
   return [...(await load()).values()].map((s) => s.meta).sort(entrySortKey);
 }
 
-/** Owner's entries with decrypted content (legacy rows pass through). */
-export async function listEntriesFor(ownerId: string, udk: Buffer | undefined): Promise<EntryMeta[]> {
+/** Owner's entries with decrypted content (legacy rows pass through).
+ *  Pass the scope key to also get people[]; without it those stay empty. */
+export async function listEntriesFor(
+  ownerId: string,
+  udk: Buffer | undefined,
+  scopeKey: Buffer | undefined,
+): Promise<EntryMeta[]> {
   const rows = [...(await load()).values()]
     .filter((s) => s.meta.ownerId === ownerId || s.meta.userId === ownerId)
     .sort((a, b) => entrySortKey(a.meta, b.meta));
-  return rows.map((s) => decryptStored(s, udk));
+  return rows.map((s) => decryptStored(s, udk, scopeKey));
 }
 
 /** ids of rows not yet rewritten into the encrypted shape */
@@ -464,8 +523,9 @@ export async function listLegacyEntryIds(ownerId?: string): Promise<string[]> {
 
 /** Filtered + cursor-paginated list (v1), content decrypted with the owner's key. */
 export async function listEntriesPage(
-  query: ListEntriesQuery = {},
-  udk?: Buffer,
+  query: ListEntriesQuery,
+  udk: Buffer | undefined,
+  scopeKey: Buffer | undefined,
 ): Promise<ListEntriesResult> {
   const limit = Math.min(100, Math.max(1, Math.floor(query.limit ?? 50)));
   let rows = [...(await load()).values()];
@@ -488,7 +548,7 @@ export async function listEntriesPage(
     }
   }
 
-  const page = rows.slice(0, limit).map((s) => decryptStored(s, udk));
+  const page = rows.slice(0, limit).map((s) => decryptStored(s, udk, scopeKey));
   const last = page[page.length - 1];
   const nextCursor =
     page.length === limit && last ? encodeCursor(last.takenAt || last.createdAt, last.id) : null;
@@ -500,13 +560,36 @@ export async function getEntry(id: string): Promise<EntryMeta | undefined> {
   return (await load()).get(id)?.meta;
 }
 
-/** Full meta with content — every caller that reads title/diary/chat uses this. */
+/** Full meta with content — every caller that reads title/diary/chat uses this.
+ *  Pass the scope key when the caller also needs people[] (face chips, scene
+ *  prompts, exports); without it people[] comes back empty. */
 export async function getEntryDecrypted(
   id: string,
   udk: Buffer | undefined,
+  scopeKey: Buffer | undefined,
 ): Promise<EntryMeta | undefined> {
   const stored = (await load()).get(id);
-  return stored ? decryptStored(stored, udk) : undefined;
+  return stored ? decryptStored(stored, udk, scopeKey) : undefined;
+}
+
+/** Face refs for one entry, without touching the owner's content envelope — for
+ *  the callers that only need to know who is in the photo. Without the scope key
+ *  (or on a foreign scope's ciphertext) the refs come back empty, exactly as an
+ *  unscanned entry would look. */
+export async function readEntryFaces(
+  id: string,
+  scopeKey: Buffer | undefined,
+): Promise<{ people: PersonRef[]; unknownFaces: number } | undefined> {
+  const stored = (await load()).get(id);
+  if (!stored) return undefined;
+  const unknownFaces = stored.meta.unknownFaces;
+  if (!stored.encPeople) return { people: stored.meta.people, unknownFaces };
+  if (!scopeKey) return { people: [], unknownFaces };
+  try {
+    return { people: decryptJson<{ people: PersonRef[] }>(stored.encPeople, scopeKey).people, unknownFaces };
+  } catch {
+    return { people: [], unknownFaces };
+  }
 }
 
 /** Entry is visible to user only when they own it. */
@@ -528,8 +611,15 @@ export async function putEntry(
   udk: Buffer,
 ): Promise<boolean> {
   const id = meta.id;
-  const full = sanitizeMeta({ ...meta, imageHash: hashImage(image) } as unknown as Record<string, unknown>);
-  const stored = toStored(full, udk);
+  // Face refs are never accepted at create: they come from the scan, which seals
+  // them under the scope key. Taking them from the uploader's metadata would write
+  // the co-occurrence graph to disk in the clear, with no key here to encrypt it.
+  const full = sanitizeMeta({
+    ...meta,
+    people: [],
+    imageHash: hashImage(image),
+  } as unknown as Record<string, unknown>);
+  const stored = toStored(full, udk, null);
   const metaJson = diskJson(stored);
   const encImage = encryptBuffer(image, udk);
   const encThumb = encryptBuffer(thumb, udk);
@@ -608,22 +698,76 @@ const STRUCTURAL_PATCH_KEYS = new Set([
 ]);
 
 /** Structural-only patch — works without any key (face scan markers, migrations).
- *  Content fields are rejected here; use patchEntryContent for those. */
+ *  Content fields are rejected here; use patchEntryContent for those.
+ *
+ *  `people` may only be CLEARED here. Clearing needs no key (the envelope is
+ *  discarded, not rewritten), which is what lets a scope change reset the face
+ *  links of a member who is offline. Setting them needs the scope key — see
+ *  patchEntryFaces. */
 export async function patchEntry(
   id: string,
   patch: Record<string, unknown>,
 ): Promise<EntryMeta | undefined> {
   const illegal = Object.keys(patch).filter((k) => !STRUCTURAL_PATCH_KEYS.has(k));
   if (illegal.length) throw new Error(`patchEntry got content fields: ${illegal.join(', ')}`);
+  if (Array.isArray(patch.people) && patch.people.length)
+    throw new Error('patchEntry cannot set face refs — use patchEntryFaces (needs the scope key)');
   const patchCopy = { ...patch };
   return entryQueue(id, async () => {
     const map = await load();
     const cur = map.get(id);
     if (!cur) return undefined;
+    // Face refs are sealed under the scope key, so they cannot outlive a scope
+    // change: after it, entryScopeId points somewhere whose key never opens them,
+    // and no rotation of either scope would ever try. Dropping them here makes that
+    // structural instead of every caller having to remember to pass `people: []` —
+    // the entry simply reads as unscanned until the next scan refills it.
+    const movesScope =
+      'familyId' in patchCopy &&
+      (typeof patchCopy.familyId === 'string' && ID_RE.test(patchCopy.familyId)
+        ? patchCopy.familyId
+        : null) !== cur.meta.familyId;
+    const encPeople = 'people' in patchCopy || movesScope ? null : cur.encPeople;
+    if (movesScope) patchCopy.people = [];
     const nextMeta = sanitizeMeta({ ...cur.meta, ...patchCopy, id });
-    const next: StoredEntry = cur.enc
-      ? { meta: blankContent(nextMeta), enc: cur.enc }
-      : { meta: nextMeta, enc: null };
+    const next: StoredEntry = {
+      meta: toStructural(nextMeta, cur.enc, encPeople),
+      enc: cur.enc,
+      encPeople,
+    };
+    await writeAtomic(DIR + id + '.json', diskJson(next));
+    map.set(id, next);
+    changeFeed.publish(nextMeta.ownerId || nextMeta.userId, id, 'updated');
+    return next.meta;
+  });
+}
+
+/** Persist a face scan's result. The refs go into their own scope-keyed envelope;
+ *  the counters and the scan marker stay structural so a keyless pass can still
+ *  tell a scanned entry from an unscanned one. */
+export async function patchEntryFaces(
+  id: string,
+  faces: { people: PersonRef[]; unknownFaces: number; faceScannedAt: number; imageHash?: string },
+  scopeKey: Buffer,
+): Promise<EntryMeta | undefined> {
+  return entryQueue(id, async () => {
+    const map = await load();
+    const cur = map.get(id);
+    if (!cur) return undefined;
+    const nextMeta = sanitizeMeta({
+      ...cur.meta,
+      people: faces.people,
+      unknownFaces: faces.unknownFaces,
+      faceScannedAt: faces.faceScannedAt,
+      ...(faces.imageHash ? { imageHash: faces.imageHash } : {}),
+      id,
+    });
+    const encPeople = encryptJson({ people: nextMeta.people }, scopeKey);
+    const next: StoredEntry = {
+      meta: toStructural(nextMeta, cur.enc, encPeople),
+      enc: cur.enc,
+      encPeople,
+    };
     await writeAtomic(DIR + id + '.json', diskJson(next));
     map.set(id, next);
     changeFeed.publish(nextMeta.ownerId || nextMeta.userId, id, 'updated');
@@ -651,11 +795,13 @@ export async function updateEntryContent(
     const map = await load();
     const cur = map.get(id);
     if (!cur) return undefined;
-    const full = decryptStored(cur, udk);
+    // No scope key here: a content write neither reads nor rewrites the face refs,
+    // it just carries their envelope across untouched.
+    const full = decryptStored(cur, udk, undefined);
     const patch = mutator(full);
     if (patch == null) return full;
     const nextFull = sanitizeMeta({ ...full, ...patch, id });
-    const next = toStored(nextFull, udk);
+    const next = toStored(nextFull, udk, cur.encPeople);
     await writeAtomic(DIR + id + '.json', diskJson(next));
     map.set(id, next);
     changeFeed.publish(nextFull.ownerId || nextFull.userId, id, 'updated');
@@ -663,7 +809,12 @@ export async function updateEntryContent(
   });
 }
 
-/** Lazy at-rest migration of one legacy row: encrypt content + blobs, set imageHash. */
+/** Lazy at-rest migration of one legacy row: encrypt content + blobs, set imageHash.
+ *  Face refs are deliberately NOT touched here: this runs with the owner's UDK,
+ *  while the refs belong to the ENTRY's scope. Sealing them with whatever key the
+ *  unlocking account happens to hold would put them under a key that neither the
+ *  readers nor the rotation pass (both keyed by entryScopeId) would ever use.
+ *  encryptScopePeople owns that migration. */
 export async function encryptEntryRecord(id: string, udk: Buffer): Promise<boolean> {
   return entryQueue(id, async () => {
     const map = await load();
@@ -683,7 +834,7 @@ export async function encryptEntryRecord(id: string, udk: Buffer): Promise<boole
       }
     }
     const nextFull = sanitizeMeta({ ...cur.meta, imageHash, id });
-    const next = toStored(nextFull, udk);
+    const next = toStored(nextFull, udk, cur.encPeople);
     files.push({ path: DIR + id + '.json', data: diskJson(next) });
     await replaceFiles(files);
     map.set(id, next);
@@ -691,18 +842,42 @@ export async function encryptEntryRecord(id: string, udk: Buffer): Promise<boole
   });
 }
 
-/** Rewrite person refs on every entry: merge (targetId set) or delete (undefined). */
-export async function rewritePersonRefs(fromId: string, targetId?: string): Promise<void> {
-  // Snapshot only decides which entries to touch; the actual rewrite recomputes
-  // from the current people[] inside the per-entry lock so a concurrent face scan
-  // or another rewrite on the same entry can't be clobbered by a stale snapshot.
+/** Refs of one entry, whichever shape they are stored in. */
+function readPeople(stored: StoredEntry, scopeKey: Buffer): PersonRef[] | null {
+  if (!stored.encPeople) return stored.meta.people;
+  try {
+    return decryptJson<{ people: PersonRef[] }>(stored.encPeople, scopeKey).people;
+  } catch {
+    return null; // another scope's key (or a rotation in flight) — leave it alone
+  }
+}
+
+/** Rewrite person refs on every entry in one scope: merge (targetId set) or
+ *  delete (undefined). Scope-limited because the refs are now sealed under the
+ *  scope key, and only that scope's members can open — or rewrite — them. */
+export async function rewritePersonRefs(
+  fromId: string,
+  targetId: string | undefined,
+  scopeKey: Buffer,
+): Promise<void> {
+  // Every entry is considered, not just the ones whose scope field matches: a
+  // member's rows can still carry familyId null before their scope migration runs,
+  // and skipping those would leave the merged-away person referenced forever. What
+  // actually bounds the work is the key — readPeople returns null for refs this
+  // scope cannot open, and those are left untouched.
+  //
+  // Whether an entry mentions `fromId` is re-read inside the per-entry lock, so a
+  // concurrent face scan or another rewrite can't be clobbered by a stale snapshot.
+  // (It also has to be: the structural view no longer carries people[] for
+  // encrypted rows.)
   for (const snapshot of await listEntries()) {
-    if (!snapshot.people.some((ref) => ref.personId === fromId)) continue;
     await entryQueue(snapshot.id, async () => {
       const map = await load();
       const cur = map.get(snapshot.id);
-      if (!cur || !cur.meta.people.some((ref) => ref.personId === fromId)) return;
-      const next = cur.meta.people.flatMap((ref) => {
+      if (!cur) return;
+      const people = readPeople(cur, scopeKey);
+      if (!people?.some((ref) => ref.personId === fromId)) return;
+      const next = people.flatMap((ref) => {
         if (ref.personId !== fromId) return [ref];
         return targetId ? [{ ...ref, personId: targetId }] : [];
       });
@@ -713,13 +888,83 @@ export async function rewritePersonRefs(fromId: string, targetId?: string): Prom
               candidate.personId === ref.personId && candidate.faceIndex === ref.faceIndex,
           ) === i,
       );
+      const nextMeta = sanitizeMeta({ ...cur.meta, people: deduped, id: cur.meta.id });
+      const encPeople = cur.encPeople ? encryptJson({ people: nextMeta.people }, scopeKey) : null;
       const nextStored: StoredEntry = {
-        meta: sanitizeMeta({ ...cur.meta, people: deduped, id: cur.meta.id }),
+        meta: toStructural(nextMeta, cur.enc, encPeople),
         enc: cur.enc,
+        encPeople,
       };
-      if (cur.enc) nextStored.meta = blankContent(nextStored.meta);
       await writeAtomic(DIR + cur.meta.id + '.json', diskJson(nextStored));
       map.set(cur.meta.id, nextStored);
+    });
+  }
+}
+
+/** Seal any face refs still sitting in the clear in this scope. Entries written
+ *  before the refs had their own envelope have encrypted CONTENT already, so the
+ *  owner-keyed migration never revisits them — without this pass their
+ *  co-occurrence graph would stay readable on disk forever. Returns how many rows
+ *  were rewritten. */
+export async function encryptScopePeople(scopeId: string, scopeKey: Buffer): Promise<number> {
+  let sealed = 0;
+  for (const snapshot of await listEntries()) {
+    if (entryScopeId(snapshot) !== scopeId) continue;
+    // The structural view blanks people[] for rows that already have an envelope,
+    // so a non-empty list here IS the "still plaintext" marker — no lock needed to
+    // skip the rows this pass has nothing to do for (it reruns on every unlock).
+    if (!snapshot.people.length) continue;
+    const done = await entryQueue(snapshot.id, async () => {
+      const map = await load();
+      const cur = map.get(snapshot.id);
+      if (!cur || cur.encPeople || !cur.meta.people.length) return false;
+      const encPeople = encryptJson({ people: cur.meta.people }, scopeKey);
+      const next: StoredEntry = {
+        meta: toStructural(cur.meta, cur.enc, encPeople),
+        enc: cur.enc,
+        encPeople,
+      };
+      await writeAtomic(DIR + cur.meta.id + '.json', diskJson(next));
+      map.set(cur.meta.id, next);
+      return true;
+    });
+    if (done) sealed++;
+  }
+  return sealed;
+}
+
+/** Re-key every entry's face refs in a scope (family-key rotation). Resumable the
+ *  same way people/relationships are: the destination key is tried first, so a pass
+ *  that died partway converges when it runs again. */
+export async function reencryptScopePeople(
+  scopeId: string,
+  oldKey: Buffer,
+  newKey: Buffer,
+): Promise<void> {
+  for (const snapshot of await listEntries()) {
+    if (entryScopeId(snapshot) !== scopeId) continue;
+    await entryQueue(snapshot.id, async () => {
+      const map = await load();
+      const cur = map.get(snapshot.id);
+      if (!cur?.encPeople) return;
+      let payload: { people: PersonRef[] };
+      try {
+        payload = decryptJson<{ people: PersonRef[] }>(cur.encPeople, newKey);
+      } catch {
+        try {
+          payload = decryptJson<{ people: PersonRef[] }>(cur.encPeople, oldKey);
+        } catch {
+          // Neither key opens this one — it belongs to a scope it no longer claims.
+          // Skip it: letting the throw escape would abort the pass, leaving every
+          // entry after it un-rotated, and the same record would abort the retry on
+          // every subsequent login the same way.
+          console.warn('[store] skipping entry whose face refs match neither key', snapshot.id);
+          return;
+        }
+      }
+      const next: StoredEntry = { ...cur, encPeople: encryptJson(payload, newKey) };
+      await writeAtomic(DIR + cur.meta.id + '.json', diskJson(next));
+      map.set(cur.meta.id, next);
     });
   }
 }

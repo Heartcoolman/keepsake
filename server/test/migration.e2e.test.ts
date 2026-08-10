@@ -2,7 +2,7 @@
  *  the new server, log in → structural family migration + lazy at-rest encryption
  *  must leave the API contents identical and the disk free of plaintext. */
 import assert from 'node:assert/strict';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { hashPassword } from '../src/accounts.ts';
@@ -135,6 +135,22 @@ test('legacy plaintext data migrates to encrypted multi-family shape on first lo
       await new Promise((r) => setTimeout(r, 100));
     }
     assert.deepEqual(hits, [], `plaintext found on disk:\n${hits.join('\n')}`);
+
+    // The seeded legacy edge was named `admin1__p1.json` — its endpoints WERE the
+    // filename. Once encrypted it must live under a keyed tag instead, with the
+    // person ids gone from both the name and the body; otherwise the relationship
+    // graph stays reconstructable from a directory listing alone.
+    const relDir = resolve(server.dataDir, 'relationships');
+    const relFiles = await readdir(relDir);
+    assert.ok(relFiles.length > 0, 'expected the migrated edge to still exist');
+    for (const name of relFiles) {
+      assert.ok(!name.includes('__'), `edge ${name} kept the plaintext pair filename`);
+      const body = await readFile(resolve(relDir, name), 'utf8');
+      for (const personId of ['admin1', 'p1']) {
+        assert.ok(!name.includes(personId), `edge filename ${name} leaks ${personId}`);
+        assert.ok(!body.includes(personId), `edge file ${name} leaks ${personId}`);
+      }
+    }
   } catch (error) {
     throw new Error(`${(error as Error).message}\nserver logs:\n${server.logs()}`);
   } finally {
