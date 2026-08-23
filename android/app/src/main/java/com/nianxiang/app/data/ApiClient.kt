@@ -397,18 +397,6 @@ class ApiClient(private val session: SessionStore) {
             buildJsonObject { put("force", force) },
         )
 
-    fun streamChat(entryId: String, messages: List<ChatMessage>): Flow<String> =
-        streamSse("/api/v1/entries/$entryId/chat", buildJsonObject {
-            put("messages", messagesToJson(messages))
-        })
-
-    fun streamDiary(entryId: String, messages: List<ChatMessage>, dateStr: String, mood: String): Flow<String> =
-        streamSse("/api/v1/entries/$entryId/diary", buildJsonObject {
-            put("messages", messagesToJson(messages))
-            put("dateStr", dateStr)
-            put("mood", mood)
-        })
-
     fun streamMonthly(yearMonth: String): Flow<String> =
         streamSse("/api/v1/monthly/$yearMonth/generate", buildJsonObject {})
 
@@ -660,17 +648,6 @@ class ApiClient(private val session: SessionStore) {
                 put("entryId", ref.entryId)
                 put("faceIndex", ref.faceIndex)
             })
-        }
-    }
-
-    private fun messagesToJson(messages: List<ChatMessage>): JsonArray = buildJsonArray {
-        messages.forEach { m ->
-            add(
-                buildJsonObject {
-                    put("role", m.role)
-                    put("content", m.content)
-                },
-            )
         }
     }
 
