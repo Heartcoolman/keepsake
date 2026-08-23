@@ -65,7 +65,7 @@ export async function runFamilyMigration(): Promise<void> {
     const owner =
       all.filter((a) => a.role === 'admin' && !a.disabled).sort((a, b) => a.createdAt - b.createdAt)[0] ??
       all[0]!;
-    const family = await families.createFamily('我的家庭', owner.id);
+    const family = await families.createFamilyUnsealed('我的家庭', owner.id);
     familyId = family.id;
 
     for (const account of all) {

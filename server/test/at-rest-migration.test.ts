@@ -143,3 +143,96 @@ test('entry face refs written before the refs envelope get sealed by the scope p
     await rm(temp, { recursive: true, force: true });
   }
 });
+
+test('a person enrolled before the co-occurrence move keeps its refs, then seals them', async () => {
+  const temp = await sandbox('nianxiang-enroll-');
+  try {
+    const crypto = await load<typeof import('../src/crypto.ts')>(temp, 'crypto.ts');
+    const fk = randomBytes(32);
+    const now = Date.now();
+
+    // the previous on-disk shape: content sealed, enrolledFrom beside it in the clear
+    await mkdir(resolve(temp, 'data/people'), { recursive: true });
+    const path = resolve(temp, 'data/people/person-delta-0004.json');
+    await writeFile(
+      path,
+      JSON.stringify({
+        id: 'person-delta-0004',
+        scopeId: SCOPE,
+        isUser: false,
+        createdAt: now,
+        updatedAt: now,
+        enrolledFrom: [{ entryId: 'entry-seaside-01', faceIndex: 2 }],
+        enc: crypto.encryptJson({ name: '妈妈', relation: '母亲', relations: {}, templates: [[0.1, 0.2]] }, fk),
+      }),
+    );
+
+    const people = await load<typeof import('../src/people.ts')>(temp, 'people.ts');
+    const before = await people.getPerson('person-delta-0004', fk);
+    assert.deepEqual(
+      before?.enrolledFrom,
+      [{ entryId: 'entry-seaside-01', faceIndex: 2 }],
+      'the pre-upgrade refs must still be readable',
+    );
+
+    // any write moves them inside the envelope
+    await people.updatePerson('person-delta-0004', fk, (p) => ({ ...p, relation: '妈' }));
+    const body = await readFile(path, 'utf8');
+    assert.ok(!body.includes('entry-seaside-01'), `person file still leaks the enrolment photo: ${body}`);
+    assert.ok(!body.includes('enrolledFrom'), 'the structural copy must be gone, not emptied');
+
+    const reloaded = await load<typeof import('../src/people.ts')>(temp, 'people.ts', 2);
+    const after = await reloaded.getPerson('person-delta-0004', fk);
+    assert.deepEqual(after?.enrolledFrom, [{ entryId: 'entry-seaside-01', faceIndex: 2 }]);
+    assert.equal(after?.relation, '妈');
+    assert.equal(after?.name, '妈妈');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('a family name is sealed under the family key and hidden from the deployer', async () => {
+  const temp = await sandbox('nianxiang-famname-');
+  try {
+    const families = await load<typeof import('../src/families.ts')>(temp, 'families.ts');
+    const fk = randomBytes(32);
+    const created = await families.createFamily('李家', 'owner-1', fk);
+    assert.equal(created.name, '李家');
+
+    const path = resolve(temp, `data/families/${created.id}.json`);
+    const body = await readFile(path, 'utf8');
+    assert.ok(!body.includes('李家'), `family file still leaks the name: ${body}`);
+
+    const reloaded = await load<typeof import('../src/families.ts')>(temp, 'families.ts', 2);
+    assert.equal((await reloaded.getFamily(created.id, fk))?.name, '李家');
+    assert.equal((await reloaded.getFamily(created.id))?.name, '', 'no key must mean no name');
+    assert.deepEqual((await reloaded.listFamilies()).map((f) => f.name), [''], 'the ops listing must not carry names');
+    assert.equal((await reloaded.getFamily(created.id, randomBytes(32)))?.name, '', 'a wrong key hides the name rather than throwing');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('a family created before the name was sealed still reads, then seals on first keyed read', async () => {
+  const temp = await sandbox('nianxiang-famup-');
+  try {
+    const families = await load<typeof import('../src/families.ts')>(temp, 'families.ts');
+    const legacy = await families.createFamilyUnsealed('老李家', 'owner-1');
+    assert.equal(legacy.name, '老李家');
+    const path = resolve(temp, `data/families/${legacy.id}.json`);
+    assert.ok((await readFile(path, 'utf8')).includes('老李家'), 'the fixture must start as plaintext');
+
+    const fk = randomBytes(32);
+    const reloaded = await load<typeof import('../src/families.ts')>(temp, 'families.ts', 2);
+    assert.equal((await reloaded.getFamily(legacy.id, fk))?.name, '老李家');
+    await new Promise((r) => setTimeout(r, 50)); // the re-seal runs behind the read
+    const body = await readFile(path, 'utf8');
+    assert.ok(!body.includes('老李家'), `family file still leaks the name after migration: ${body}`);
+
+    const cold = await load<typeof import('../src/families.ts')>(temp, 'families.ts', 3);
+    assert.equal((await cold.getFamily(legacy.id, fk))?.name, '老李家');
+    assert.equal((await cold.getFamily(legacy.id))?.name, '');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});

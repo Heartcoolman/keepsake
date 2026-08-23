@@ -222,6 +222,7 @@ opsRoutes.get('/families', async (c) => {
   for (const family of await families.listFamilies()) {
     items.push({
       id: family.id,
+      // The name is sealed under the family key, which this console does not hold.
       name: family.name,
       ownerId: family.ownerId,
       createdAt: family.createdAt,
@@ -241,7 +242,7 @@ opsRoutes.delete('/families/:id', async (c) => {
   const family = await families.getFamily(c.req.param('id'));
   if (!family) return err(c, 'NOT_FOUND', 'family not found');
   const result = await dissolveFamily(family.id);
-  audit(c.get('operator'), 'family.dissolve', family.name, `${result.members} member(s) detached`);
+  audit(c.get('operator'), 'family.dissolve', family.id, `${result.members} member(s) detached`);
   return c.json({ ok: true, ...result });
 });
 

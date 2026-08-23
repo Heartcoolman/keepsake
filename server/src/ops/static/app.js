@@ -685,13 +685,14 @@ async function tabFamilies() {
   const blocks = data.items.map((f) =>
     el('div', { class: 'card', style: 'margin-bottom:12px' },
       el('div', { class: 'row', style: 'justify-content:space-between' },
-        el('strong', null, f.name),
+        el('strong', null, f.name || '家庭 ' + f.id.slice(0, 8)),
         el('button', { class: 'small danger', onclick: async (e) => {
           const btn = e.currentTarget;
+          // 家庭名以家庭密钥加密,本台不持有;确认口令改用家庭 id。
           if (await modalConfirmTyped(
-            '解散家庭「' + f.name + '」?\n共享人物库与 ' + f.members.length +
+            '解散家庭 ' + f.id + '?\n共享人物库与 ' + f.members.length +
             ' 位成员的人脸建档将永久丢失(密文随密钥一同作废,无法恢复),成员回到独立状态。',
-            f.name,
+            f.id,
           ))
             act(() => api('/families/' + encodeURIComponent(f.id), { method: 'DELETE' }), '家庭已解散', btn);
         } }, '解散'),

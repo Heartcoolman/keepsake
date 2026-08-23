@@ -238,11 +238,12 @@ async function registerFamilyAccount(input: {
     role: 'admin',
     accountType: 'family',
   });
+  const fk = randomKey();
   const family = await families.createFamily(
     input.familyName?.trim() || `${created.account.displayName}的家庭`,
     created.account.id,
+    fk,
   );
-  const fk = randomKey();
   const updated = await accounts.updateAccount(created.account.id, (cur) => ({
     ...cur,
     familyId: family.id,

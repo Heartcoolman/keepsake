@@ -7,14 +7,25 @@ import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createKeyedQueue } from './lib/keyedQueue.ts';
 import { writeAtomic } from './lib/atomicFile.ts';
-import { isSealedBox, type SealedBox } from './crypto.ts';
+import { decryptJson, encryptJson, isEnvelope, isSealedBox, type Envelope, type SealedBox } from './crypto.ts';
 
 export interface Family {
   id: string;
+  /** Empty when the caller supplied no family key — the deployer's view of a family. */
   name: string;
   ownerId: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/** On-disk record: the name is sealed under the family key (`name` = legacy plaintext row). */
+interface StoredFamily {
+  id: string;
+  ownerId: string;
+  createdAt: number;
+  updatedAt: number;
+  encName: Envelope | null;
+  legacyName: string | null;
 }
 
 export interface Invite {
@@ -31,26 +42,57 @@ const INVITE_DIR = fileURLToPath(new URL('../data/invites/', import.meta.url));
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 const MAX_NAME = 40;
 
-let families: Map<string, Family> | null = null;
+let families: Map<string, StoredFamily> | null = null;
 let invites: Map<string, Invite> | null = null;
-let familiesLoad: Promise<Map<string, Family>> | null = null;
+let familiesLoad: Promise<Map<string, StoredFamily>> | null = null;
 let invitesLoad: Promise<Map<string, Invite>> | null = null;
 const familyQueue = createKeyedQueue();
 const inviteQueue = createKeyedQueue();
 
-function normalizeFamily(raw: unknown): Family | null {
+function cleanName(v: unknown): string {
+  return typeof v === 'string' ? v.trim().slice(0, MAX_NAME) : '';
+}
+
+function normalizeFamily(raw: unknown): StoredFamily | null {
   if (!raw || typeof raw !== 'object') return null;
   const v = raw as Record<string, unknown>;
   if (typeof v.id !== 'string' || !ID_RE.test(v.id)) return null;
   if (typeof v.ownerId !== 'string' || !ID_RE.test(v.ownerId)) return null;
-  if (typeof v.name !== 'string' || !v.name.trim()) return null;
+  const legacyName = cleanName(v.name);
+  if (!isEnvelope(v.encName) && !legacyName) return null;
   return {
     id: v.id,
-    name: v.name.trim().slice(0, MAX_NAME),
     ownerId: v.ownerId,
     createdAt: Number.isFinite(Number(v.createdAt)) ? Number(v.createdAt) : Date.now(),
     updatedAt: Number.isFinite(Number(v.updatedAt)) ? Number(v.updatedAt) : Date.now(),
+    encName: isEnvelope(v.encName) ? v.encName : null,
+    legacyName: isEnvelope(v.encName) ? null : legacyName,
   };
+}
+
+function diskJson(stored: StoredFamily): string {
+  const { legacyName, encName, ...rest } = stored;
+  return JSON.stringify(legacyName ? { ...rest, name: legacyName } : { ...rest, encName });
+}
+
+function tryOpenName(env: Envelope, fk: Buffer): string {
+  try {
+    return decryptJson<{ name: string }>(env, fk).name;
+  } catch {
+    return '';
+  }
+}
+
+/** The name only comes back when the caller holds the family key. */
+function toFamily(stored: StoredFamily, fk?: Buffer): Family {
+  const { encName, legacyName, ...rest } = stored;
+  let name = legacyName ?? '';
+  if (encName) {
+    // A wrong key is a display problem, not a request failure: the name is the only thing
+    // sealed here, and every other field the caller needs is structural.
+    name = fk ? cleanName(tryOpenName(encName, fk)) : '';
+  }
+  return { ...rest, name };
 }
 
 function normalizeInvite(raw: unknown): Invite | null {
@@ -91,7 +133,7 @@ async function loadDir<T>(
   return map;
 }
 
-async function loadFamilies(): Promise<Map<string, Family>> {
+async function loadFamilies(): Promise<Map<string, StoredFamily>> {
   if (families) return families;
   familiesLoad ??= loadDir(FAMILY_DIR, normalizeFamily, (f) => f.id).then((m) => (families = m));
   try {
@@ -113,31 +155,77 @@ async function loadInvites(): Promise<Map<string, Invite>> {
   }
 }
 
-export async function createFamily(name: string, ownerId: string, id?: string): Promise<Family> {
+export async function createFamily(name: string, ownerId: string, fk: Buffer, id?: string): Promise<Family> {
   const now = Date.now();
-  const family = normalizeFamily({
+  const clean = cleanName(name) || '我的家庭';
+  const stored = normalizeFamily({
     id: id && ID_RE.test(id) ? id : randomUUID(),
-    name: name.trim() || '我的家庭',
     ownerId,
     createdAt: now,
     updatedAt: now,
+    encName: encryptJson({ name: clean }, fk),
   });
-  if (!family) throw new Error('invalid family');
-  return familyQueue(family.id, async () => {
+  if (!stored) throw new Error('invalid family');
+  return familyQueue(stored.id, async () => {
     const map = await loadFamilies();
     await mkdir(FAMILY_DIR, { recursive: true });
-    await writeAtomic(FAMILY_DIR + family.id + '.json', JSON.stringify(family));
-    map.set(family.id, family);
-    return family;
+    await writeAtomic(FAMILY_DIR + stored.id + '.json', diskJson(stored));
+    map.set(stored.id, stored);
+    return toFamily(stored, fk);
   });
 }
 
-export async function getFamily(id: string): Promise<Family | undefined> {
-  return (await loadFamilies()).get(id);
+/**
+ * The pre-v1 migration runs before any account has crypto, so the family it creates for the
+ * existing accounts starts as a legacy plaintext row; the first keyed read seals it.
+ */
+export async function createFamilyUnsealed(name: string, ownerId: string, id?: string): Promise<Family> {
+  const now = Date.now();
+  const stored = normalizeFamily({
+    id: id && ID_RE.test(id) ? id : randomUUID(),
+    ownerId,
+    createdAt: now,
+    updatedAt: now,
+    name: cleanName(name) || '我的家庭',
+  });
+  if (!stored) throw new Error('invalid family');
+  return familyQueue(stored.id, async () => {
+    const map = await loadFamilies();
+    await mkdir(FAMILY_DIR, { recursive: true });
+    await writeAtomic(FAMILY_DIR + stored.id + '.json', diskJson(stored));
+    map.set(stored.id, stored);
+    return toFamily(stored);
+  });
 }
 
+/**
+ * Without [fk] the name comes back empty: the family name is the one thing in this record
+ * worth reading, and whoever holds the disk is not supposed to. A row still carrying a
+ * plaintext name is re-sealed the first time someone reads it with the key.
+ */
+export async function getFamily(id: string, fk?: Buffer): Promise<Family | undefined> {
+  const stored = (await loadFamilies()).get(id);
+  if (!stored) return undefined;
+  if (stored.legacyName && fk) void sealLegacyName(stored, fk);
+  return toFamily(stored, fk);
+}
+
+async function sealLegacyName(stored: StoredFamily, fk: Buffer): Promise<void> {
+  await familyQueue(stored.id, async () => {
+    const map = await loadFamilies();
+    const cur = map.get(stored.id);
+    if (!cur?.legacyName) return;
+    const next: StoredFamily = { ...cur, encName: encryptJson({ name: cur.legacyName }, fk), legacyName: null };
+    await writeAtomic(FAMILY_DIR + cur.id + '.json', diskJson(next));
+    map.set(cur.id, next);
+  }).catch((e: unknown) => console.warn('[families] cannot seal legacy name', e));
+}
+
+/** Ops listing: structure only, never the names. */
 export async function listFamilies(): Promise<Family[]> {
-  return [...(await loadFamilies()).values()].sort((a, b) => a.createdAt - b.createdAt);
+  return [...(await loadFamilies()).values()]
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .map((f) => toFamily(f));
 }
 
 /** Ops dissolution: remove the family record (member/scope cleanup is the caller's). */

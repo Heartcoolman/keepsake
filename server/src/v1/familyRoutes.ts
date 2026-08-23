@@ -10,7 +10,7 @@ import * as people from '../people.ts';
 import * as relationships from '../relationships.ts';
 import * as store from '../store.ts';
 import * as keyring from '../keyring.ts';
-import { randomKey, sealToPub } from '../crypto.ts';
+import { openSealed, randomKey, sealToPub } from '../crypto.ts';
 import { rotateScopeCiphertext } from '../scopeRotation.ts';
 import { err } from './errors.ts';
 import { requireKeys, type AppEnv } from './middleware.ts';
@@ -50,7 +50,7 @@ function isFamilyOwner(account: accounts.Account): boolean {
 familyRoutes.get('/family', async (c) => {
   const account = c.get('account');
   if (!account.familyId) return c.json({ family: null, members: [], invites: [] });
-  const family = await families.getFamily(account.familyId);
+  const family = await families.getFamily(account.familyId, keyring.getFamilyKey(account.familyId));
   if (!family) return c.json({ family: null, members: [], invites: [] });
   const members = (await accounts.listAccounts(family.id)).map(accounts.toPublic);
   const invites = isFamilyOwner(account)
@@ -82,11 +82,12 @@ familyRoutes.post('/family', familyBodyLimit, async (c) => {
   if (!udk || !priv || !account.pubKey) return err(c, 'E_KEYS_LOCKED', 'unlock required');
 
   const body = await c.req.json<{ name?: unknown }>().catch(() => ({} as Record<string, unknown>));
+  const fk = randomKey();
   const family = await families.createFamily(
     typeof body.name === 'string' && body.name.trim() ? body.name : `${account.displayName}的家庭`,
     account.id,
+    fk,
   );
-  const fk = randomKey();
   const updated = (await accounts.updateAccount(account.id, (cur) => ({
     ...cur,
     familyId: family.id,
@@ -196,7 +197,17 @@ familyRoutes.get('/me/invites', async (c) => {
   const account = c.get('account');
   const invites = await Promise.all(
     (await families.listInvitesForAccount(account.id)).map(async (i) => {
-      const family = await families.getFamily(i.familyId);
+      // the invitee holds no family key yet, but the invite itself carries one sealed to them
+      const priv = keyring.getPriv(account.id);
+      let fk: Buffer | undefined;
+      if (priv && account.pubKey) {
+        try {
+          fk = openSealed(i.sealedFk, priv, Buffer.from(account.pubKey, 'base64url'));
+        } catch {
+          fk = undefined; // stale grant; the name simply stays hidden
+        }
+      }
+      const family = await families.getFamily(i.familyId, fk);
       const inviter = await accounts.getAccount(i.inviterId);
       return {
         id: i.id,
@@ -227,7 +238,6 @@ familyRoutes.post('/me/invites/:id/accept', async (c) => {
 
   let fk: Buffer;
   try {
-    const { openSealed } = await import('../crypto.ts');
     fk = openSealed(invite.sealedFk, priv, Buffer.from(account.pubKey, 'base64url'));
   } catch {
     // stale grant (family key rotated after this invite was sent)
@@ -288,9 +298,10 @@ familyRoutes.post('/me/invites/:id/accept', async (c) => {
     fk,
   });
 
+  const named = (await families.getFamily(invite.familyId, fk)) ?? family;
   return c.json({
     ok: true,
-    family: { id: family.id, name: family.name, ownerId: family.ownerId },
+    family: { id: named.id, name: named.name, ownerId: named.ownerId },
     user: accounts.toPublic(account),
   });
 });

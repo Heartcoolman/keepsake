@@ -65,6 +65,9 @@ interface PersonContent {
   relation: string;
   relations: Record<string, string>;
   templates: number[][];
+  /** Which face of which photo this person was enrolled from — a co-occurrence edge in the
+   *  clear, so it belongs inside the envelope with the templates it came from. */
+  enrolledFrom: { entryId: string; faceIndex: number }[];
 }
 
 /** On-disk record: sensitive bundle in `enc` (null = legacy plaintext row). */
@@ -74,6 +77,7 @@ interface StoredPerson {
   isUser: boolean;
   createdAt: number;
   updatedAt: number;
+  /** Structural copy kept only for rows written before enrolledFrom moved into `enc`. */
   enrolledFrom: { entryId: string; faceIndex: number }[];
   enc: Envelope | null;
   /** inline content, only for legacy rows */
@@ -105,13 +109,13 @@ function normalizeContent(value: Record<string, unknown>): PersonContent | null 
     relation: typeof value.relation === 'string' ? value.relation.trim().slice(0, 40) : '',
     relations,
     templates,
+    enrolledFrom: normalizeEnrolledFrom(value.enrolledFrom),
   };
 }
 
-function normalizeStructural(value: Record<string, unknown>): Omit<StoredPerson, 'enc' | 'legacy'> | null {
-  if (typeof value.id !== 'string' || !ID_RE.test(value.id)) return null;
-  const enrolledFrom = Array.isArray(value.enrolledFrom)
-    ? value.enrolledFrom
+function normalizeEnrolledFrom(raw: unknown): { entryId: string; faceIndex: number }[] {
+  return Array.isArray(raw)
+    ? raw
         .filter((row): row is { entryId: string; faceIndex: number } =>
           !!row && typeof row === 'object' &&
           typeof (row as Record<string, unknown>).entryId === 'string' &&
@@ -120,6 +124,11 @@ function normalizeStructural(value: Record<string, unknown>): Omit<StoredPerson,
         .map((row) => ({ entryId: row.entryId.slice(0, 64), faceIndex: Math.max(0, Math.min(19, Number(row.faceIndex))) }))
         .slice(-MAX_TEMPLATES)
     : [];
+}
+
+function normalizeStructural(value: Record<string, unknown>): Omit<StoredPerson, 'enc' | 'legacy'> | null {
+  if (typeof value.id !== 'string' || !ID_RE.test(value.id)) return null;
+  const enrolledFrom = normalizeEnrolledFrom(value.enrolledFrom);
   return {
     id: value.id,
     scopeId: typeof value.scopeId === 'string' && ID_RE.test(value.scopeId) ? value.scopeId : '',
@@ -152,14 +161,16 @@ function decryptStored(stored: StoredPerson, key: Buffer | undefined): Person {
     if (!normalized) throw new Error('corrupt person content');
     content = normalized;
   }
+  // Rows written before enrolledFrom moved inside the envelope still carry it structurally;
+  // the sealed copy wins once it exists, and the next write drops the plaintext one.
   return {
     id: stored.id,
     scopeId: stored.scopeId,
     isUser: stored.isUser,
     createdAt: stored.createdAt,
     updatedAt: stored.updatedAt,
-    enrolledFrom: stored.enrolledFrom,
     ...content,
+    enrolledFrom: content.enrolledFrom.length ? content.enrolledFrom : stored.enrolledFrom,
   };
 }
 
@@ -169,6 +180,7 @@ function toStored(p: Person, key: Buffer): StoredPerson {
     relation: p.relation,
     relations: p.relations,
     templates: p.templates,
+    enrolledFrom: p.enrolledFrom,
   };
   return {
     id: p.id,
@@ -176,7 +188,7 @@ function toStored(p: Person, key: Buffer): StoredPerson {
     isUser: p.isUser,
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
-    enrolledFrom: p.enrolledFrom,
+    enrolledFrom: [],
     enc: encryptJson(content, key),
     legacy: null,
   };
@@ -188,7 +200,8 @@ function diskJson(stored: StoredPerson): string {
     const { enc: _enc, ...structural } = rest;
     return JSON.stringify({ ...structural, ...legacy });
   }
-  return JSON.stringify(rest);
+  const { enrolledFrom, ...sealed } = rest;
+  return JSON.stringify(enrolledFrom.length ? rest : sealed);
 }
 
 /** Validate a Person shape before persisting (mirrors the legacy normalizePerson). */
