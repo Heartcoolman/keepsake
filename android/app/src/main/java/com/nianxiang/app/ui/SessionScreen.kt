@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -67,6 +68,8 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextIndent
@@ -217,6 +220,8 @@ fun SessionScreen(
                 changeInput = { input = it },
                 listening = listening,
                 toggleSpeech = toggleSpeech,
+                showOrbitHint = state.phase == "chatting" && !orbitHintExpired,
+                showAnalyzingHint = state.phase == "loading" || state.phase == "analyzing",
                 send = {
                     val text = input.trim()
                     if (text.isNotEmpty()) {
@@ -230,49 +235,55 @@ fun SessionScreen(
             )
         }
 
-        NxIconButton(
-            Icons.AutoMirrored.Filled.ArrowBack,
-            "回到时光轴",
-            leave,
-            modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(start = 14.dp, top = 10.dp),
-        )
-
-        // Tabs and date stack in one column so the date can never slide under the
-        // tab pill when the status-bar inset shrinks (e.g. landscape).
-        Column(
-            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 8.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+        // One header row: back | tabs/date (weighted center) | subtitle toggle.
+        // Slot layout makes overlap impossible however narrow the screen — the old
+        // free-floating date + toggle collided on phones (日期压住字幕模式按钮).
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(start = 14.dp, end = 14.dp, top = 8.dp),
+            verticalAlignment = Alignment.Top,
         ) {
-            if (entry.status == "done") {
-                NxSegmentedControl(
-                    options = listOf("diary" to "日记", "chat" to "对话"),
-                    selected = state.sessionTab,
-                    onSelected = viewModel::setSessionTab,
-                )
+            NxIconButton(Icons.AutoMirrored.Filled.ArrowBack, "回到时光轴", leave)
+            Column(
+                modifier = Modifier.weight(1f).padding(top = 2.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (entry.status == "done") {
+                    NxSegmentedControl(
+                        options = listOf("diary" to "日记", "chat" to "对话"),
+                        selected = state.sessionTab,
+                        onSelected = viewModel::setSessionTab,
+                    )
+                }
+                if (!diaryVisible) {
+                    DatePill(entry, pickDate)
+                }
             }
             if (!diaryVisible) {
-                DatePill(entry, pickDate)
-            }
-        }
-
-        if (!diaryVisible) {
-            Surface(
-                onClick = { textHidden = !textHidden },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(top = 10.dp, end = 14.dp),
-                color = Color(0x9918181C),
-                shape = RoundedCornerShape(50),
-                border = BorderStroke(1.dp, Color(0x12FFFFFF)),
-            ) {
-                Text(
-                    if (textHidden) "字幕模式 · 点按显示文字" else "字幕模式 · 点按隐去文字",
-                    color = NxColors.TextFaint,
-                    fontSize = 11.sp,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                )
+                Surface(
+                    onClick = { textHidden = !textHidden },
+                    // compact label so the pill fits beside the centered date on phones;
+                    // the full wording stays in contentDescription for a11y
+                    modifier = Modifier.semantics {
+                        contentDescription =
+                            if (textHidden) "字幕模式 · 点按显示文字" else "字幕模式 · 点按隐去文字"
+                    },
+                    color = Color(0x9918181C),
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(1.dp, Color(0x12FFFFFF)),
+                ) {
+                    Text(
+                        if (textHidden) "显示文字" else "隐去文字",
+                        color = NxColors.TextDim,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    )
+                }
+            } else {
+                Spacer(Modifier.size(38.dp)) // mirror the back button so tabs stay centered
             }
         }
 
@@ -281,32 +292,6 @@ fun SessionScreen(
                 delay(6_000)
                 orbitHintExpired = true
             }
-        }
-        AnimatedVisibility(
-            visible = state.phase == "chatting" && !orbitHintExpired,
-            enter = fadeIn(),
-            exit = fadeOut(animationSpec = tween(800)),
-            modifier = Modifier
-                .align(Alignment.BottomStart)
-                .navigationBarsPadding()
-                .padding(start = 22.dp, bottom = 168.dp),
-        ) {
-            Text(
-                "拖动环视 · 双指缩放 · 双击复位",
-                color = NxColors.TextFaint,
-                fontSize = 11.sp,
-                letterSpacing = 1.2.sp,
-            )
-        }
-
-        if (state.phase == "loading" || state.phase == "analyzing") {
-            Text(
-                "念念正在端详这张照片…",
-                color = NxColors.TextDim,
-                fontFamily = NxSerif,
-                fontSize = 13.sp,
-                modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 112.dp),
-            )
         }
         AnimatedVisibility(
             visible = state.phase == "condensing",
@@ -377,6 +362,8 @@ private fun ChatView(
     changeInput: (String) -> Unit,
     listening: Boolean,
     toggleSpeech: () -> Unit,
+    showOrbitHint: Boolean,
+    showAnalyzingHint: Boolean,
     send: () -> Unit,
     writeDiary: () -> Unit,
     nameFace: (Int) -> Unit,
@@ -391,7 +378,7 @@ private fun ChatView(
         LazyColumn(
             Modifier.fillMaxSize(),
             state = conversationState,
-            contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 118.dp, bottom = 166.dp),
+            contentPadding = PaddingValues(start = 22.dp, end = 22.dp, top = 118.dp, bottom = 200.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             item { Spacer(Modifier.fillParentMaxHeight(0.5f)) }
@@ -411,6 +398,47 @@ private fun ChatView(
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // Hints live in the bottom column flow so they can never slide under or
+            // behind the face chips / condense button / input row (fixed offsets did).
+            AnimatedVisibility(
+                visible = showOrbitHint,
+                enter = fadeIn(),
+                exit = fadeOut(animationSpec = tween(800)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(Modifier.fillMaxWidth()) {
+                    // dark chip keeps the hint legible over the bright particle photo
+                    Surface(
+                        color = Color(0x80121216),
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, Color(0x0FFFFFFF)),
+                    ) {
+                        Text(
+                            "拖动环视 · 双指缩放 · 双击复位",
+                            color = NxColors.TextDim,
+                            fontSize = 11.sp,
+                            letterSpacing = 1.2.sp,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+            }
+            AnimatedVisibility(
+                visible = showAnalyzingHint,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    "念念正在端详这张照片…",
+                    color = NxColors.TextDim,
+                    fontFamily = NxSerif,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center,
+                    style = TextStyle(shadow = Shadow(Color.Black, Offset(0f, 1f), 8f)),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                )
+            }
             FaceRow(entry, state, viewModel, nameFace)
             if (state.sessionMessages.any { it.role == "user" }) {
                 CondenseButton(
@@ -469,14 +497,26 @@ private fun ConversationLine(message: ChatMessage) {
                 )
             }
         } else {
-            Text(
-                message.content.ifBlank { "· · ·" },
-                color = NxColors.Text,
-                fontSize = 14.5.sp,
-                lineHeight = 25.sp,
-                style = TextStyle(shadow = Shadow(Color.Black, Offset(0f, 2f), 12f)),
-                modifier = Modifier.fillMaxWidth(0.72f),
-            )
+            // 念念's lines are subtitles floating on the photo — on a phone the photo
+            // fills the screen and its bright regions wash plain white text out.
+            // Light 50% chip + soft glyph shadow: text stays legible while the sand
+            // particles still shine through at half brightness under the words.
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.72f)
+                    .wrapContentWidth(Alignment.Start),
+                shape = RoundedCornerShape(14.dp),
+                color = Color(0x80141418),
+            ) {
+                Text(
+                    message.content.ifBlank { "· · ·" },
+                    color = NxColors.Text,
+                    fontSize = 14.5.sp,
+                    lineHeight = 25.sp,
+                    style = TextStyle(shadow = Shadow(Color.Black, Offset(0f, 1f), 10f)),
+                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 9.dp),
+                )
+            }
         }
     }
 }
