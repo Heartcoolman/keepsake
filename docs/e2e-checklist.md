@@ -82,7 +82,7 @@ Lint 剩余 10 个提示：8 个依赖有新版、目标 SDK 35 不是本机最�
 
 上节记录停在 2026-07-19。此后新增的功能列于本节。服务端侧多数已由自动化测试覆盖，标注 ✅ 的无需人工重复；标注 ☐ 的需要真机或人眼判断。
 
-最后一次自动化验证：2026-08-24，`pnpm typecheck` 0 错误，`pnpm test` 40 项中 39 通过、1 项因选中私有 core 而跳过（含 session open/message/complete 与 PATCH 封锁用例）。
+最后一次自动化验证：2026-08-24（P5 收敛与计费之后），`pnpm typecheck` 0 错误，`pnpm test` 55 项中 54 通过、1 项因选中私有 core 而跳过（跳过原因直接打印在 `node --test` 输出里）。独立版 `:app:testDebugUnitTest` 136 项 0 失败、5 跳过（跳过为需真密钥/网络的 live 测试）。
 
 本节所有 ☐ 项的逐步操作指引见私有仓 `core/docs/acceptance-20260824.md`（含独立版与 Apple 端验收）。
 
@@ -141,3 +141,43 @@ memory 记录的遗留项，是本轮优先级最高的验收内容。
 
 - ☐ `/ops` 控制台显示的模型版本、运行时状态、推理速度与实际一致（e4f5ed3）
 - ☐ 管理员账号可管账号与备份，但读不到任何用户内容
+
+---
+
+# 第三轮：P5 收敛与计费（2026-08-24 之后新增）
+
+## 服务端与运维（自动化已覆盖）
+
+- ✅ 套餐额度闸门：软阈 80% 响应头、硬阈 100% `QUOTA_EXCEEDED`、调用与 token 两个维度独立触发 · `billing.e2e.test.ts`
+- ✅ 非 AI 端点不受额度影响（额度用尽后仍可列表、上传、读取） · `billing.e2e.test.ts`
+- ✅ 年度册为套餐能力，`free` 下返回 `FORBIDDEN` 而非 `QUOTA_EXCEEDED` · `billing.e2e.test.ts`
+- ✅ 运维台切换套餐、清零当月计数，两者均入审计且不泄漏口令 · `billing.e2e.test.ts`
+- ✅ 授权令牌的 `seats` / `plans` 声明解析、缺省兼容、非法取值拒绝、签名覆盖 · `license.test.ts`
+- ✅ 套餐配额表与席位计数的边界 · `entitlements.test.ts`
+- ✅ 单实例锁：第二实例拒绝启动、死 pid 锁重夺、截断锁不卡启动 · `instance-lock.e2e.test.ts`
+- ✅ 独立版 LLM 密钥密文落盘、锁库时不暴露、清空即关闭 · 独立版 `LlmSettingsTest`
+
+## 一次性核对（命令即判据，无需真机）
+
+- ✅ 独立版 release APK 不含密钥：`unzip -p app-release.apk classes.dex | strings | grep -cE 'sk-[A-Za-z0-9]{20,}'` → 0
+- ✅ 配置面三处一致：`./scripts/check-env-parity.sh` → `env parity OK (22 个变量,三处一致)`
+- ✅ 孤儿权重清零：`/ops` 模型页签无 `orphan` 标记（matting v1/v2/v3 已删，`server/models` 559M → 424M）
+- ✅ 两个 Android 工程 `lintDebug` 0 错误（此前各有 1 个：NAS 缺 `ACCESS_NETWORK_STATE`、独立版 `setIsStrongBoxBacked` 的 NewApi）
+
+## 需真机或人眼判断
+
+- ☐ 独立版：「设置 → 模型」填入自己的 API 密钥后念念可对话；清空密钥后仅念念停口，导入 / 粒子 / 认人 / 导出照常
+- ☐ 独立版：覆盖安装内置密钥版之后，`llm-config.json` 随存量库一同加密迁移，填入密钥即可用
+- ☐ 首启无密钥时的提示文案指向设置页（不再提 local.properties）
+- ☐ 运维台「授权」页签显示的 licensee / 到期 / 席位占用与实际令牌一致
+- ☐ 运维台账户页签切换套餐后，该账户的额度行为随即改变
+- ☐ 达到额度后三端（Web / Android / Apple）显示「本月的 AI 额度已用完…」而非通用错误
+- ☐ 已用 80% 后 Web 出现一次额度提醒 toast
+- ☐ 同一 `data/` 目录启动第二个实例被拒绝，日志给出占用 pid（NAS 上验证一次）
+- ☐ NAS Android 客户端反复切后台/回前台不崩溃（补 `ACCESS_NETWORK_STATE` 之后；此前 `registerDefaultNetworkCallback` 按 API 契约会抛 `SecurityException`，该推断未实测）
+- ☐ NAS Android 客户端断网导入排队、恢复网络自动续传（依赖上一条；第二轮同名条目此前从未通过验收）
+
+## 部署前必办
+
+- ☐ **轮换已泄漏的 Moonshot 密钥**：它随 0.1.0 版 APK 分发过，代码修复不能追回已发出的密钥
+- ☐ NAS 部署前建立成对回滚句柄（镜像 + data 备份）：本轮改动 `Account.plan` 字段语义并新增 `data/migration-plan.json` 迁移标记
