@@ -5,6 +5,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { sweepOrphanTransients } from './lib/atomicFile.ts';
+import { acquireInstanceLock } from './lib/instanceLock.ts';
 import * as store from './store.ts';
 import * as accounts from './accounts.ts';
 import { countOpsAccounts } from './ops/opsAccounts.ts';
@@ -29,6 +30,16 @@ try {
   accounts.assertAuthConfigured();
 } catch (error) {
   console.error(`[auth] ${(error as Error).message}`);
+  process.exit(1);
+}
+
+// Claim the data directory before anything reads or writes it (the transient sweep and
+// the migrations below both write). Placed after the exits above so a misconfigured
+// start leaves no lock behind.
+try {
+  acquireInstanceLock(fileURLToPath(new URL('../data/', import.meta.url)), PORT);
+} catch (error) {
+  console.error(`[lock] ${(error as Error).message}`);
   process.exit(1);
 }
 
