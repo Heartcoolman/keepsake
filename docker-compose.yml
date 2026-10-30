@@ -11,14 +11,25 @@ services:
       - XAI_API_KEY=${XAI_API_KEY:-}
       - AI_BASE_URL=${AI_BASE_URL:-}
       - AI_MODEL=${AI_MODEL:-}
+      - NIANXIANG_LICENSE_FILE=${NIANXIANG_LICENSE_FILE:-}
       - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
+      - ALLOW_EPHEMERAL_JWT=${ALLOW_EPHEMERAL_JWT:-0}
       - BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN:-}
       - REGISTRATION_CODE=${REGISTRATION_CODE:-}
       - OPS_BOOTSTRAP_TOKEN=${OPS_BOOTSTRAP_TOKEN:-}
       - TRUST_PROXY=${TRUST_PROXY:-0}
       - COOKIE_SECURE=${COOKIE_SECURE:-}
-      # optional host-side DA3 depth sidecar (OpenVINO iGPU); empty = local DA2 fallback
+      # the container clock is UTC; without this, memories shot before 08:00 carry
+      # an export date one day earlier than the App shows
+      - APP_TZ=${APP_TZ:-Asia/Shanghai}
+      # optional host-side OpenVINO iGPU sidecars; empty = local CPU ONNX fallback
       - DEPTH_SIDECAR_URL=${DEPTH_SIDECAR_URL:-}
+      - DEPTH_SIDECAR_TILES=${DEPTH_SIDECAR_TILES:-1}
+      - MATTING_SIDECAR_URL=${MATTING_SIDECAR_URL:-}
+      - INFERENCE_DISABLED=${INFERENCE_DISABLED:-0}
+      - INFERENCE_TIMEOUT_MS=${INFERENCE_TIMEOUT_MS:-}
+      - KEYRING_IDLE_TTL_MS=${KEYRING_IDLE_TTL_MS:-}
+      - CHANGES_HEARTBEAT_MS=${CHANGES_HEARTBEAT_MS:-}
       - NODE_ENV=production
     extra_hosts:
       - "host.docker.internal:host-gateway"
