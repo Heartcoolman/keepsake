@@ -49,6 +49,8 @@ input, select {
   width: 100%;
 }
 input:focus { outline: none; border-color: var(--accent); }
+/* 表格单元格里的套餐下拉:跟随内容宽度,不撑满整列 */
+select.small { width: auto; padding: 3px 8px; font-size: 12px; }
 
 button {
   background: rgba(255, 255, 255, 0.08);

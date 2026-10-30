@@ -35,6 +35,10 @@ let currentUser: AuthUser | null = null;
 let refreshInflight: Promise<boolean> | null = null;
 let authLostHandler: (() => void) | null = null;
 let keysLockedHandler: (() => void) | null = null;
+let usageWarningHandler: ((percent: number) => void) | null = null;
+/** Warnings repeat on every AI call once the threshold is crossed; showing each one
+ *  would bury the conversation, so the same text is announced once per session. */
+let usageWarningShown = 0;
 
 /** Register once from useUserStore to transition UI when refresh fails. */
 export function onAuthLost(handler: (() => void) | null): void {
@@ -45,6 +49,23 @@ export function onAuthLost(handler: (() => void) | null): void {
  *  (server restart) — prompt for the password (POST /auth/unlock), no logout. */
 export function onKeysLocked(handler: (() => void) | null): void {
   keysLockedHandler = handler;
+}
+
+/** Register once from useUserStore: the plan quota is close to spent (X-Usage-Warning). */
+export function onUsageWarning(handler: ((percent: number) => void) | null): void {
+  usageWarningHandler = handler;
+}
+
+function notifyUsageWarning(res: Response): void {
+  const percent = Number(res.headers.get('x-usage-warning'));
+  // only re-announce when it has climbed a further 5 points
+  if (!Number.isFinite(percent) || percent <= 0 || percent < usageWarningShown + 5) return;
+  usageWarningShown = percent;
+  try {
+    usageWarningHandler?.(percent);
+  } catch {
+    // ignore
+  }
 }
 
 function notifyKeysLocked(): void {
@@ -164,6 +185,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   NOT_FOUND: '对象不存在或已被删除',
   VALIDATION: '输入不合法,请检查后重试',
   CONFLICT: '操作冲突,请刷新后重试',
+  QUOTA_EXCEEDED: '本月的 AI 额度已用完,下月自动恢复;需要更多可联系部署方升级套餐',
   RATE_LIMITED: '尝试次数过多,请稍后再试',
   PAYLOAD_TOO_LARGE: '提交内容过大',
 };
@@ -278,6 +300,7 @@ export async function apiFetch(path: string, init: ApiFetchInit = {}): Promise<R
       // non-JSON 423 — ignore
     }
   }
+  notifyUsageWarning(res);
   return res;
 }
 

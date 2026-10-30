@@ -8,6 +8,7 @@ private let friendlyErrorTable: [String: String] = [
     "NOT_FOUND": "对象不存在或已被删除",
     "VALIDATION": "输入不合法,请检查后重试",
     "CONFLICT": "操作冲突,请刷新后重试",
+    "QUOTA_EXCEEDED": "本月的 AI 额度已用完,下月自动恢复;需要更多可联系部署方升级套餐",
     "RATE_LIMITED": "尝试次数过多,请稍后再试",
     "PAYLOAD_TOO_LARGE": "提交内容过大",
 ]

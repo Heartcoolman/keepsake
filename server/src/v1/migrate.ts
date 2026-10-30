@@ -11,6 +11,7 @@ import * as relationships from '../relationships.ts';
 const DATA_DIR = fileURLToPath(new URL('../../data/', import.meta.url));
 const MARKER = DATA_DIR + 'migration-v1.json';
 const FAMILY_MARKER = DATA_DIR + 'migration-family.json';
+const PLAN_MARKER = DATA_DIR + 'migration-plan.json';
 
 interface Marker {
   version: 1;
@@ -95,4 +96,50 @@ export async function runFamilyMigration(): Promise<void> {
   await mkdir(DATA_DIR, { recursive: true });
   const marker: FamilyMarker = { version: 1, completedAt: Date.now(), familyId };
   await writeFile(FAMILY_MARKER, JSON.stringify(marker, null, 2));
+}
+
+interface PlanMarker {
+  version: 1;
+  completedAt: number;
+  grandfathered: number;
+}
+
+/**
+ * Grandfathering for the introduction of paid plans.
+ *
+ * Before quotas existed every account was unmetered and every account could build the
+ * annual book. Shipping the gate with everyone still reading `plan: "free"` would silently
+ * take both away from libraries that already had them, so accounts present at the moment
+ * the gate arrives are moved to the plan that matches what they already had. Accounts
+ * created afterwards start on `free`, which is the point of the gate.
+ *
+ * A deployment whose license does not grant `family` degrades these to `free` on read
+ * (planOf), so this cannot hand out more than the token allows.
+ */
+export async function runPlanMigration(): Promise<void> {
+  try {
+    const existing = JSON.parse(await readFile(PLAN_MARKER, 'utf8')) as PlanMarker;
+    if (existing.version === 1) return;
+  } catch {
+    // not migrated yet
+  }
+
+  let grandfathered = 0;
+  for (const account of await accounts.listAccounts()) {
+    if (account.plan !== 'free') continue;
+    const updated = await accounts.updateAccount(account.id, (cur) => ({
+      ...cur,
+      plan: 'family',
+      updatedAt: Date.now(),
+    }));
+    if (updated) grandfathered++;
+  }
+
+  await mkdir(DATA_DIR, { recursive: true });
+  const marker: PlanMarker = { version: 1, completedAt: Date.now(), grandfathered };
+  await writeFile(PLAN_MARKER, JSON.stringify(marker, null, 2));
+  console.log(
+    `[migrate-plan] grandfathered ${grandfathered} pre-billing account(s) to the family plan; ` +
+      'new accounts follow the deployment license',
+  );
 }

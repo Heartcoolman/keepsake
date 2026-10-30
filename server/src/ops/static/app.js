@@ -297,6 +297,7 @@ const TABS = [
   ['accounts', '账户'],
   ['families', '家庭'],
   ['usage', '用量'],
+  ['license', '授权'],
   ['registration', '注册'],
   ['operators', '操作员'],
   ['audit', '审计'],
@@ -346,6 +347,7 @@ async function loadTab() {
     else if (currentTab === 'accounts') await tabAccounts();
     else if (currentTab === 'families') await tabFamilies();
     else if (currentTab === 'usage') await tabUsage();
+    else if (currentTab === 'license') await tabLicense();
     else if (currentTab === 'registration') await tabRegistration();
     else if (currentTab === 'operators') await tabOperators();
     else if (currentTab === 'audit') await tabAudit();
@@ -648,6 +650,7 @@ async function tabAccounts() {
       el('td', null, a.familyId ? a.familyName || a.familyId : el('span', { class: 'muted' }, '独立')),
       el('td', { class: 'num' }, String(a.entryCount)),
       el('td', { class: 'num' }, fmtBytes(a.storageBytes)),
+      el('td', null, planCell(a)),
       el('td', null, status.length ? status : el('span', { class: 'pill' }, '正常')),
       el('td', null, el('div', { class: 'row' },
         el('button', { class: 'small' + (a.disabled ? '' : ' danger'), onclick: async (e) => {
@@ -667,14 +670,86 @@ async function tabAccounts() {
     );
   });
   replace($section,
-    el('p', { class: 'muted' }, '运维台只见结构信息 — 内容均为密文,无法读取,也不能重置用户密码(仅恢复码可找回)。'),
+    el('p', { class: 'muted' }, '运维台只见结构信息 — 内容均为密文,无法读取,也不能重置用户密码(仅恢复码可找回)。改套餐即刻生效,不影响已发出的令牌。'),
     el('div', { class: 'table-wrap' }, el('table', null,
       el('thead', null, el('tr', null,
         el('th', null, '账户'), el('th', null, '类型'), el('th', null, '家庭'),
         el('th', { class: 'num' }, '条目'), el('th', { class: 'num' }, '占用'),
-        el('th', null, '状态'), el('th', null, '操作'))),
-      el('tbody', null, rows.length ? rows : el('tr', null, el('td', { colspan: '7', class: 'muted' }, '暂无账户'))),
+        el('th', null, '套餐 / 本月用量'), el('th', null, '状态'), el('th', null, '操作'))),
+      el('tbody', null, rows.length ? rows : el('tr', null, el('td', { colspan: '8', class: 'muted' }, '暂无账户'))),
     )),
+  );
+}
+
+/** 套餐 + 本月配额使用率;下拉切换套餐,超额后可清零当月计数作为误判补偿。 */
+function planCell(a) {
+  const st = a.planStatus;
+  const quota = st.quota;
+  const unmetered = quota.monthlyAiCalls < 0 && quota.monthlyTokens < 0;
+  const ratio = Math.round(st.used * 100);
+  const cls = ratio >= 100 ? 'pill bad' : ratio >= 80 ? 'pill warn' : 'pill';
+  const select = el('select', {
+    class: 'small',
+    onchange: (e) => {
+      const next = e.currentTarget.value;
+      act(() => api('/accounts/' + encodeURIComponent(a.id), { method: 'PATCH', body: JSON.stringify({ plan: next }) }),
+        '套餐已改为 ' + next, e.currentTarget);
+    },
+  }, PLAN_ORDER.map((id) => el('option', { value: id, selected: id === st.plan ? '' : null }, id)));
+  return el('div', null,
+    select,
+    el('div', { class: 'muted', style: 'margin-top:4px' },
+      unmetered
+        ? '不限额 · ' + st.usage.calls + ' 次'
+        : st.usage.calls + '/' + (quota.monthlyAiCalls < 0 ? '∞' : quota.monthlyAiCalls) + ' 次 · ' +
+          st.usage.tokens + '/' + (quota.monthlyTokens < 0 ? '∞' : quota.monthlyTokens) + ' tokens'),
+    unmetered ? null : el('span', { class: cls, style: 'margin-top:4px;display:inline-block' }, ratio + '%'),
+  );
+}
+
+const PLAN_ORDER = ['free', 'standard', 'family'];
+
+// ---------- 授权 ----------
+
+async function tabLicense() {
+  const l = await api('/license');
+  const rows = [
+    ['状态', l.licensed ? '已授权' : '未授权(演示模式:AI 为占位实现、推理关闭)'],
+    ['授权给', l.licensee || '—'],
+    ['版本', l.edition || '—'],
+    ['签发', l.issuedAt || '—'],
+    ['到期', l.expiresAt ? l.expiresAt + (l.daysLeft !== null ? '(剩 ' + l.daysLeft + ' 天)' : '') : '永久'],
+    ['席位', l.seats === null ? '不限' : l.accounts + ' / ' + l.seats],
+    ['可发放套餐', l.plans.join('、')],
+  ];
+  const quotaRows = PLAN_ORDER.filter((id) => l.plans.includes(id)).map((id) => {
+    const q = l.quotas[id];
+    return el('tr', null,
+      el('td', null, id),
+      el('td', { class: 'num' }, q.monthlyAiCalls < 0 ? '不限' : String(q.monthlyAiCalls)),
+      el('td', { class: 'num' }, q.monthlyTokens < 0 ? '不限' : String(q.monthlyTokens)),
+      el('td', { class: 'num' }, String(q.familySeats)),
+      el('td', null, q.annualExport ? '✓' : '—'),
+    );
+  });
+  replace($section,
+    l.demoMode
+      ? el('p', { class: 'error' }, '未检测到有效授权令牌,服务运行在演示模式。设置 NIANXIANG_LICENSE 或放置 nianxiang.license 后重启。')
+      : l.expiringSoon
+        ? el('p', { class: 'error' }, '授权将在 ' + l.daysLeft + ' 天后到期;到期后服务降级为演示模式。')
+        : el('p', { class: 'muted' }, '授权令牌离线校验(Ed25519),不联网。换令牌需重启进程。'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('tbody', null, rows.map(([k, v]) => el('tr', null, el('th', null, k), el('td', null, String(v))))),
+    )),
+    el('h2', { style: 'margin-top:16px' }, '套餐配额'),
+    el('div', { class: 'table-wrap' }, el('table', null,
+      el('thead', null, el('tr', null,
+        el('th', null, '套餐'), el('th', { class: 'num' }, '月调用'),
+        el('th', { class: 'num' }, '月 tokens'), el('th', { class: 'num' }, '家庭席位'),
+        el('th', null, '年度册'))),
+      el('tbody', null, quotaRows),
+    )),
+    el('p', { class: 'muted', style: 'margin-top:12px' }, '配额为近似上限:用量计数在 AI 调用后异步落盘,单账户实际消耗最多可超出配额一次调用。'),
   );
 }
 
@@ -721,7 +796,7 @@ async function tabUsage() {
         el('thead', null, el('tr', null,
           el('th', null, '账户'), el('th', { class: 'num' }, '调用'),
           el('th', { class: 'num' }, '输入 tokens'), el('th', { class: 'num' }, '输出 tokens'),
-          el('th', { class: 'num' }, '估算调用'))),
+          el('th', { class: 'num' }, '估算调用'), el('th', null, ''))),
         el('tbody', null, data.items.length ? data.items.map((u) =>
           el('tr', null,
             el('td', null, '@' + u.username),
@@ -729,12 +804,18 @@ async function tabUsage() {
             el('td', { class: 'num' }, String(u.promptTokens)),
             el('td', { class: 'num' }, String(u.completionTokens)),
             el('td', { class: 'num' }, String(u.estimatedCalls)),
-          )) : el('tr', null, el('td', { colspan: '5', class: 'muted' }, '该月无用量'))),
+            el('td', null, el('button', { class: 'small danger', onclick: async (e) => {
+              const btn = e.currentTarget;
+              if (await modalConfirm('清零 @' + u.username + ' 在 ' + month + ' 的用量计数?该账户本月配额将重新可用。', { confirmLabel: '清零' }))
+                act(() => api('/usage/' + encodeURIComponent(u.accountId) + '/' + encodeURIComponent(month), { method: 'DELETE' }),
+                  '已清零', btn);
+            } }, '清零')),
+          )) : el('tr', null, el('td', { colspan: '6', class: 'muted' }, '该月无用量'))),
       )),
     );
   };
   replace($section,
-    el('p', { class: 'muted' }, 'AI token 计量(计费预留,当前不限额)。流式响应取不到 usage 时按字符估算并计入「估算调用」。'),
+    el('p', { class: 'muted' }, 'AI token 计量,按月对比套餐配额执行闸门(见「授权」页签)。流式响应取不到 usage 时按字符估算并计入「估算调用」。'),
     el('div', { class: 'table-wrap' }, el('table', null,
       el('thead', null, el('tr', null,
         el('th', null, '月份'), el('th', { class: 'num' }, '调用'),

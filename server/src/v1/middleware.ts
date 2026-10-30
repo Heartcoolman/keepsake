@@ -2,7 +2,7 @@ import type { Context, MiddlewareHandler, Next } from 'hono';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import * as accounts from '../accounts.ts';
 import * as keyring from '../keyring.ts';
-import { canUseAi } from '../entitlements.ts';
+import { canExportAnnual, canUseAi } from '../entitlements.ts';
 import type { Account } from '../accounts.ts';
 import { err } from './errors.ts';
 
@@ -65,10 +65,21 @@ export const requireScopeOwner: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next();
 };
 
-/** Billing gate for AI routes — a stub today, the single future integration point. */
+/** Plan quota gate for the AI routes. Refuses once this month's ceiling is reached and
+ *  attaches a warning header while approaching it, so clients can say so before the
+ *  refusal lands mid-conversation. See entitlements.ts for the one-call accuracy limit. */
 export const requireAiEntitlement: MiddlewareHandler<AppEnv> = async (c, next) => {
-  const gate = canUseAi(c.get('account'));
-  if (!gate.allowed) return err(c, 'FORBIDDEN', gate.reason);
+  const gate = await canUseAi(c.get('account'));
+  if (!gate.allowed) return err(c, gate.code, gate.reason);
+  // whole-number percent of this month's quota already spent; clients phrase it
+  if (gate.warnPercent !== null) c.header('X-Usage-Warning', String(gate.warnPercent));
+  await next();
+};
+
+/** Feature gate for the annual book (plan-gated rather than metered). */
+export const requireAnnualExport: MiddlewareHandler<AppEnv> = async (c, next) => {
+  const gate = canExportAnnual(c.get('account'));
+  if (!gate.allowed) return err(c, gate.code, gate.reason);
   await next();
 };
 

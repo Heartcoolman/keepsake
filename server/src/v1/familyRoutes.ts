@@ -12,6 +12,7 @@ import * as store from '../store.ts';
 import * as keyring from '../keyring.ts';
 import { openSealed, randomKey, sealToPub } from '../crypto.ts';
 import { rotateScopeCiphertext } from '../scopeRotation.ts';
+import { canAddFamilyMember } from '../entitlements.ts';
 import { err } from './errors.ts';
 import { requireKeys, type AppEnv } from './middleware.ts';
 
@@ -169,6 +170,13 @@ familyRoutes.post('/family/invites', familyBodyLimit, async (c) => {
   const pending = await families.listInvitesForAccount(target.id);
   if (pending.some((i) => i.familyId === familyId))
     return err(c, 'CONFLICT', 'invite already pending');
+
+  // Seats are counted against members already in plus invites already out, so a burst of
+  // invites cannot overshoot the plan once they are all accepted.
+  const members = (await accounts.listAccounts(familyId)).length;
+  const outstanding = (await families.listInvitesForFamily(familyId)).length;
+  const seat = canAddFamilyMember(account, members + outstanding);
+  if (!seat.allowed) return err(c, seat.code, seat.reason);
 
   const invite = await families.createInvite({
     familyId,

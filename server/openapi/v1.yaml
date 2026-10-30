@@ -583,7 +583,26 @@ components:
         error:
           type: object
           properties:
-            code: { type: string }
+            code:
+              type: string
+              enum:
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - VALIDATION
+                - CONFLICT
+                - DUPLICATE_IMAGE
+                - QUOTA_EXCEEDED
+                - RATE_LIMITED
+                - PAYLOAD_TOO_LARGE
+                - UPSTREAM
+                - UNAVAILABLE
+                - INTERNAL
+                - E_KEYS_LOCKED
+              description: >-
+                QUOTA_EXCEEDED and FORBIDDEN share status 403 with different meaning:
+                the former is this month's plan allowance spent (it returns next month),
+                the latter is a capability the current plan does not include.
             message: { type: string }
     User:
       type: object
@@ -592,6 +611,14 @@ components:
         username: { type: string }
         displayName: { type: string }
         role: { type: string, enum: [admin, member] }
+        accountType: { type: string, enum: [family, personal] }
+        familyId: { type: string, nullable: true }
+        plan:
+          type: string
+          enum: [free, standard, family]
+          description: >-
+            Billing plan. Read-only for clients: granted by the operator console and
+            capped by the deployment's license token. See docs/api-v1.md#plans--quotas.
         disabled: { type: boolean }
         createdAt: { type: number }
         updatedAt: { type: number }

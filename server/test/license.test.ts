@@ -58,3 +58,59 @@ test('missing payload fields are rejected', () => {
     assert.equal(verifyLicenseToken(issue(bad), pubB64).ok, false);
   }
 });
+
+// ---- billing claims. Tokens issued before these existed must keep working unchanged,
+// which is why both are optional rather than defaulted at the schema level.
+
+test('a token without billing claims grants everything', () => {
+  const check = verifyLicenseToken(issue(base), pubB64);
+  assert.equal(check.ok, true);
+  if (check.ok) {
+    assert.equal(check.info.seats, null, 'no seat cap');
+    assert.equal(check.info.plans, null, 'every plan grantable');
+  }
+});
+
+test('seats and plans are carried through', () => {
+  const check = verifyLicenseToken(
+    issue({ ...base, seats: 4, plans: ['free', 'standard'] }),
+    pubB64,
+  );
+  assert.equal(check.ok, true);
+  if (check.ok) {
+    assert.equal(check.info.seats, 4);
+    assert.deepEqual(check.info.plans, ['free', 'standard']);
+  }
+});
+
+test('a fractional seat count is floored, not rounded up', () => {
+  const check = verifyLicenseToken(issue({ ...base, seats: 4.9 }), pubB64);
+  assert.equal(check.ok, true);
+  if (check.ok) assert.equal(check.info.seats, 4);
+});
+
+// NaN/Infinity are not tested here: JSON.stringify writes them as null, which the
+// verifier reads as "claim absent" — they cannot reach it through a real token.
+test('nonsensical billing claims are rejected rather than coerced', () => {
+  for (const bad of [
+    { seats: 0 },
+    { seats: -1 },
+    { seats: 'four' },
+    { plans: 'standard' },
+    { plans: [1, 2] },
+    { plans: ['free', null] },
+  ]) {
+    assert.equal(
+      verifyLicenseToken(issue({ ...base, ...bad }), pubB64).ok,
+      false,
+      `should reject: ${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('the billing claims are signed like the rest of the payload', () => {
+  const token = issue({ ...base, seats: 2 });
+  const [prefix, , sig] = token.split('.');
+  const forged = Buffer.from(JSON.stringify({ ...base, seats: 999 })).toString('base64url');
+  assert.equal(verifyLicenseToken(`${prefix}.${forged}.${sig}`, pubB64).ok, false);
+});

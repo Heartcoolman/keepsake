@@ -14,6 +14,7 @@ import * as store from '../store.ts';
 import * as keyring from '../keyring.ts';
 import { isMigrationPending } from '../deferredTasks.ts';
 import { getRegistrationPolicy } from '../ops/opsConfig.ts';
+import { defaultPlanForNewAccount, seatLimit } from '../entitlements.ts';
 import { normalizeRecoveryCode, openSealed, randomKey, sealToPub } from '../crypto.ts';
 import { err } from './errors.ts';
 import { clientIp, forwardedHeader, ipRateLimit, requireAuth, type AppEnv } from './middleware.ts';
@@ -237,6 +238,7 @@ async function registerFamilyAccount(input: {
     displayName: input.displayName,
     role: 'admin',
     accountType: 'family',
+    plan: defaultPlanForNewAccount(),
   });
   const fk = randomKey();
   const family = await families.createFamily(
@@ -267,6 +269,7 @@ async function registerPersonalAccount(input: {
     displayName: input.displayName,
     role: 'member',
     accountType: 'personal',
+    plan: defaultPlanForNewAccount(),
   });
   await ensureUserPerson(created.account, created.account.id, created.udk);
   installKeys(created.account, created, undefined);
@@ -295,6 +298,12 @@ authRoutes.post('/auth/register', ipRateLimit(10), async (c) => {
     if (!safeEqual(header || fromBody, policy.code))
       return err(c, 'UNAUTHORIZED', 'invalid registration code');
   }
+
+  // Seat cap from the deployment's license token. Checked here rather than in
+  // accounts.create so bootstrap (the first account) is never blocked out of its own server.
+  const seats = seatLimit();
+  if (seats !== null && (await accounts.countAccounts()) >= seats)
+    return err(c, 'FORBIDDEN', `this deployment is licensed for ${seats} account(s)`);
 
   const accountType = body.accountType === 'family' ? 'family' : body.accountType === 'personal' ? 'personal' : null;
   if (!accountType) return err(c, 'VALIDATION', 'accountType must be family or personal');

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { createKeyedQueue } from './lib/keyedQueue.ts';
 import { writeAtomic } from './lib/atomicFile.ts';
 import { signHS256, verifyHS256 } from './lib/jwt.ts';
+import { isPlanId, type PlanId } from './plans.ts';
 import {
   deriveKek,
   generateRecoveryCode,
@@ -37,8 +38,9 @@ export interface Account {
   role: AccountRole;
   /** family accounts own a family and can invite; personal accounts join/leave */
   accountType: AccountType;
-  /** billing reservation — no enforcement yet */
-  plan: string;
+  /** paid plan id; see entitlements.ts for what each grants. Unknown values read as
+   *  'free' rather than failing the row — a downgraded license must not lock a library. */
+  plan: PlanId;
   familyId: string | null;
   tokenVersion: number;
   /** Current refresh jti; null = accept any refresh with matching tv (legacy). */
@@ -74,7 +76,7 @@ export interface AccountPublic {
   displayName: string;
   role: AccountRole;
   accountType: AccountType;
-  plan: string;
+  plan: PlanId;
   familyId: string | null;
   disabled: boolean;
   createdAt: number;
@@ -235,7 +237,7 @@ function normalizeAccount(raw: unknown): Account | null {
     role,
     // legacy rows predate accountType — the family migration sets it explicitly
     accountType: v.accountType === 'family' ? 'family' : 'personal',
-    plan: typeof v.plan === 'string' && v.plan ? v.plan.slice(0, 32) : 'free',
+    plan: isPlanId(v.plan) ? v.plan : 'free',
     familyId: typeof v.familyId === 'string' && ID_RE.test(v.familyId) ? v.familyId : null,
     tokenVersion: Math.max(0, Math.floor(Number(v.tokenVersion) || 0)),
     refreshJti: typeof v.refreshJti === 'string' && v.refreshJti ? v.refreshJti : null,
@@ -479,6 +481,9 @@ type CreateAccountInput = {
   role: AccountRole;
   accountType: AccountType;
   familyId?: string | null;
+  /** Omitted = `free`. Callers pass entitlements.defaultPlanForNewAccount(); accounts.ts
+   *  does not read it itself, which keeps this module clear of the license boot path. */
+  plan?: PlanId;
 };
 
 export interface CreateAccountResult {
@@ -517,7 +522,7 @@ async function createAccountUnlocked(
     displayName: stripControl(input.displayName?.trim() || input.username).slice(0, 40),
     role: input.role,
     accountType: input.accountType,
-    plan: 'free',
+    plan: input.plan ?? 'free',
     familyId: input.familyId ?? null,
     tokenVersion: 0,
     refreshJti: null,

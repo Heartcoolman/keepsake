@@ -12,7 +12,7 @@ import { opsRoutes } from './ops/opsRoutes.ts';
 import { startKeyringSweep } from './keyring.ts';
 import { startDeferredTasks } from './deferredTasks.ts';
 import { createV1Router } from './v1/router.ts';
-import { runFamilyMigration, runV1Migration } from './v1/migrate.ts';
+import { runFamilyMigration, runPlanMigration, runV1Migration } from './v1/migrate.ts';
 
 const MOCK = process.env.MOCK_AI === '1';
 const configuredPort = Number(process.env.PORT || 8787);
@@ -188,6 +188,10 @@ await runV1Migration().catch((error) => {
 
 await runFamilyMigration().catch((error) => {
   console.warn('[migrate-family] skipped:', error);
+});
+
+await runPlanMigration().catch((error) => {
+  console.warn('[migrate-plan] skipped:', error);
 });
 
 startKeyringSweep();

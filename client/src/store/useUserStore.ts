@@ -20,6 +20,7 @@ import {
   loadSessionFromStorage,
   onAuthLost,
   onKeysLocked,
+  onUsageWarning,
   setSession,
   type AuthUser,
 } from '../lib/http';
@@ -116,6 +117,13 @@ export const useUserStore = create<UserState>((set, get) => {
   // Server restarted and lost its in-memory keys: ask for the password, keep the session.
   onKeysLocked(() => {
     if (get().mode === 'ready') set({ mode: 'locked', pickerOpen: true, error: null });
+  });
+  // Approaching this month's AI quota. Announced once per session by the http layer, so
+  // this only has to route it to the toast the rest of the app already uses.
+  onUsageWarning((percent) => {
+    void import('./useAppStore').then((m) =>
+      m.useAppStore.getState().showToast(`本月 AI 额度已用 ${percent}%,用尽后要等下月恢复`),
+    );
   });
 
   /** Shared authenticated-entry flow: install session, surface the recovery code, go ready. */

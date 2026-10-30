@@ -59,6 +59,26 @@ export async function recordUsage(
   }).catch((e) => console.warn('[usage] record failed:', e));
 }
 
+/** This account's counters for the current month, or null when it has not called yet.
+ *  The quota gate reads this, so it must stay a plain disk read: no keys are involved
+ *  (counters carry no user content) and it has to work before the vault is unlocked. */
+export async function currentUsage(accountId: string): Promise<UsageRecord | null> {
+  if (!accountId) return null;
+  return read(`${accountId}-${ym()}`);
+}
+
+/** Drop one account's counters for one month (ops compensation for a misjudged gate). */
+export async function resetUsage(accountId: string, yearMonth: string): Promise<boolean> {
+  if (!accountId || !yearMonth) return false;
+  const key = `${accountId}-${yearMonth}`;
+  let existed = false;
+  await enqueue(key, async () => {
+    existed = (await read(key)) !== null;
+    await rm(DIR + key + '.json', { force: true });
+  });
+  return existed;
+}
+
 /** Every usage record on disk (ops reporting). */
 export async function listUsage(): Promise<UsageRecord[]> {
   let files: string[] = [];

@@ -8,13 +8,16 @@ Error shape:
 { "error": { "code": "NOT_FOUND", "message": "..." } }
 ```
 
-Codes: `UNAUTHORIZED` | `FORBIDDEN` | `NOT_FOUND` | `VALIDATION` | `CONFLICT` | `RATE_LIMITED` | `PAYLOAD_TOO_LARGE` | `UPSTREAM` | `UNAVAILABLE` | `INTERNAL` | `E_KEYS_LOCKED`
+Codes: `UNAUTHORIZED` | `FORBIDDEN` | `NOT_FOUND` | `VALIDATION` | `CONFLICT` | `QUOTA_EXCEEDED` | `RATE_LIMITED` | `PAYLOAD_TOO_LARGE` | `UPSTREAM` | `UNAVAILABLE` | `INTERNAL` | `E_KEYS_LOCKED`
 
-Header: `X-API-Version: 1`
+`QUOTA_EXCEEDED`（403）与 `FORBIDDEN`（403）状态码相同、语义不同：前者表示本月套餐额度已用尽，下月自动恢复；后者表示当前套餐不含该能力。客户端据此给出不同文案。
+
+Headers: `X-API-Version: 1`；`X-Usage-Warning: <整数百分比>` 仅在本月额度已用过 80% 的 AI 响应上出现，取值为已用份额，措辞由客户端决定。
 
 ## Accounts & tenancy
 
-- 两类账户：**家庭账户**（`accountType: "family"`，注册即创建家庭，可邀请/移除成员；未来收费位 `plan`）与**个人账户**（`"personal"`，免费独立使用；只能接受邀请或退出家庭）。
+- 两类账户：**家庭账户**（`accountType: "family"`，注册即创建家庭，可邀请/移除成员）与**个人账户**（`"personal"`，只能接受邀请或退出家庭）。账户类型与计费无关。
+- `plan` 为计费套餐，取值 `free` / `standard` / `family`，默认 `free`；由运维台发放，客户端只读。各档配额与执行方式见 [Plans & quotas](#plans--quotas)。
 - 一台服务器可承载多个互不可见的家庭和任意独立个人账户。
 - 用户名全服唯一（login 不带家庭上下文）。
 - 没有管理员代设/重置密码：找回只能用注册时展示一次的**恢复码**。
@@ -26,6 +29,31 @@ Header: `X-API-Version: 1`
 - **People** registry / relationship graph / face caches are **scope-shared**：作用域 = 所在家庭；独立个人账户自成作用域。跨家庭完全不可见。
 - **Unassigned faces** only include faces from the caller's own entries.
 - Profile / monthly reviews are per account.
+
+## Plans & quotas
+
+| 套餐 | 月 AI 调用 | 月 tokens | 家庭席位 | 年度回忆册 |
+|---|---|---|---|---|
+| `free` | 30 | 100,000 | 2 | ✗ |
+| `standard` | 500 | 2,000,000 | 4 | ✓ |
+| `family` | 不限 | 不限 | 8 | ✓ |
+
+- **计量口径**：一次 AI 调用 = 一次上游请求（`analyze` / `chat` / `diary` / `monthly.generate` / `session.*` / 年度册生成各自计一次或多次）。计数按自然月归档，跨月自动归零。
+- **被闸门覆盖的端点**：`POST /entries/:id/analyze`、`/chat`、`/diary`、`POST /monthly/:yearMonth/generate`、`POST /entries/:id/session/{open,message,complete}`、`POST /exports/annual`。其余端点（列表、上传、读取媒体、人物、图谱、分享卡）不计量、不受额度影响——额度用尽后记忆库仍可读写，只是念念不再开口。
+- **软阈**：已用 ≥80% 时响应带 `X-Usage-Warning`。
+- **硬阈**：达 100% 返回 `QUOTA_EXCEEDED`。
+- **年度回忆册**是套餐能力而非额度项，`free` 下返回 `FORBIDDEN`。
+- **家庭席位**在发出邀请时校验，计入「已在成员 + 未接受邀请」，因此连发邀请不会在全部接受后超出套餐。
+- **精度限制**：用量计数在 AI 调用返回后异步落盘，闸门读取的是上一次落盘值，单账户实际消耗最多可超出配额一次调用。配额是量级上限，不是账目。
+
+## Deployment authorization
+
+部署级授权令牌（Ed25519 离线校验）除 `licensee` / `edition` / `issuedAt` / `expiresAt` 外可携带两个可选声明：
+
+- `seats`：该部署允许的账户总数。达到上限后 `POST /auth/register` 返回 `FORBIDDEN`；`POST /auth/bootstrap`（首个账户）永不受限。
+- `plans`：该部署可发放的套餐 id 列表。运维台发放列表外的套餐返回 `FORBIDDEN`；已存于记录上但列表外的套餐读取时降级为 `free`，不会让账户失效。
+
+两个声明缺省时按「不限席位、可发放全部套餐」处理，因此计费上线前签发的令牌无需重签。
 
 ## Encryption at rest & locked state
 

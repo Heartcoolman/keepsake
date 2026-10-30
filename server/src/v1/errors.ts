@@ -10,6 +10,9 @@ export type ErrorCode =
   /** same-owner upload of identical image bytes — response carries a top-level
    *  duplicateOf hint; resend with override to create anyway */
   | 'DUPLICATE_IMAGE'
+  /** this month's plan quota is spent — distinct from FORBIDDEN so clients can say
+   *  "quota" rather than "not allowed"; carries the same 403 status */
+  | 'QUOTA_EXCEEDED'
   | 'RATE_LIMITED'
   | 'PAYLOAD_TOO_LARGE'
   | 'UPSTREAM'
@@ -26,6 +29,7 @@ const STATUS: Record<ErrorCode, ContentfulStatusCode> = {
   VALIDATION: 400,
   CONFLICT: 409,
   DUPLICATE_IMAGE: 409,
+  QUOTA_EXCEEDED: 403,
   RATE_LIMITED: 429,
   PAYLOAD_TOO_LARGE: 413,
   UPSTREAM: 502,

@@ -11,6 +11,11 @@ export interface LicenseInfo {
   edition: string;
   issuedAt: string;
   expiresAt: string | null;
+  /** Accounts this deployment may hold; null = unmetered. Absent in tokens issued
+   *  before billing existed, which must keep working — hence optional, not defaulted. */
+  seats: number | null;
+  /** Plan ids this deployment may grant; null = all of them. */
+  plans: string[] | null;
 }
 
 export type LicenseCheck = { ok: true; info: LicenseInfo } | { ok: false; reason: string };
@@ -59,6 +64,13 @@ export function verifyLicenseToken(
   ) {
     return { ok: false, reason: 'invalid payload' };
   }
+  const rawSeats = (payload as { seats?: unknown }).seats;
+  if (rawSeats != null && (typeof rawSeats !== 'number' || !Number.isFinite(rawSeats) || rawSeats < 1))
+    return { ok: false, reason: 'invalid payload' };
+  const rawPlans = (payload as { plans?: unknown }).plans;
+  if (rawPlans != null && (!Array.isArray(rawPlans) || rawPlans.some((p) => typeof p !== 'string')))
+    return { ok: false, reason: 'invalid payload' };
+
   const expiresAt = payload.expiresAt ?? null;
   if (expiresAt) {
     const exp = Date.parse(expiresAt);
@@ -67,6 +79,13 @@ export function verifyLicenseToken(
   }
   return {
     ok: true,
-    info: { licensee: payload.licensee, edition: payload.edition, issuedAt: payload.issuedAt, expiresAt },
+    info: {
+      licensee: payload.licensee,
+      edition: payload.edition,
+      issuedAt: payload.issuedAt,
+      expiresAt,
+      seats: rawSeats == null ? null : Math.floor(rawSeats),
+      plans: rawPlans == null ? null : (rawPlans as string[]),
+    },
   };
 }

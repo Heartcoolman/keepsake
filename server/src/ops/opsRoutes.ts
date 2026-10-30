@@ -22,6 +22,9 @@ import { ipRateLimit } from '../v1/middleware.ts';
 import { audit, readAuditTail } from './audit.ts';
 import { getRegistrationPolicy, setRegistrationPolicy } from './opsConfig.ts';
 import { dissolveFamily, purgeAccountData } from './purge.ts';
+import { grantablePlans, planStatus, seatLimit } from '../entitlements.ts';
+import { PLANS, isPlanId } from '../plans.ts';
+import { license } from '../licenseBoot.ts';
 import { createBackup, deleteBackup, getSystemSnapshot, listBackups } from './systemInfo.ts';
 
 type OpsEnv = { Variables: { operator: ops.OpsAccount } };
@@ -175,6 +178,7 @@ opsRoutes.get('/accounts', async (c) => {
       entryCount: entryCounts.get(account.id) ?? 0,
       storageBytes: await store.ownerStorageBytes(account.id),
       migrationPending: await isMigrationPending(account.id),
+      planStatus: await planStatus(account),
     });
   }
   return c.json({ items });
@@ -182,13 +186,30 @@ opsRoutes.get('/accounts', async (c) => {
 
 opsRoutes.patch('/accounts/:id', opsBodyLimit, async (c) => {
   const body = await c.req
-    .json<{ disabled?: unknown }>()
+    .json<{ disabled?: unknown; plan?: unknown }>()
     .catch(() => ({} as Record<string, unknown>));
-  if (typeof body.disabled !== 'boolean')
-    return err(c, 'VALIDATION', 'disabled (boolean) required');
-  const disabled = body.disabled;
   const target = await accounts.getAccount(c.req.param('id'));
   if (!target) return err(c, 'NOT_FOUND', 'account not found');
+
+  // A plan change is its own operation: it neither revokes tokens nor wipes keys, so it
+  // must not be folded into the disable path below.
+  if (body.plan !== undefined) {
+    if (!isPlanId(body.plan)) return err(c, 'VALIDATION', 'plan must be one of ' + Object.keys(PLANS).join(', '));
+    const plan = body.plan;
+    if (!grantablePlans().includes(plan))
+      return err(c, 'FORBIDDEN', `this deployment's license does not grant the ${plan} plan`);
+    const changed = await accounts.updateAccount(target.id, (cur) => ({
+      ...cur,
+      plan,
+      updatedAt: Date.now(),
+    }));
+    audit(c.get('operator'), 'account.plan', target.username, `${target.plan} -> ${plan}`);
+    return c.json({ user: accounts.toPublic(changed ?? target), planStatus: await planStatus(changed ?? target) });
+  }
+
+  if (typeof body.disabled !== 'boolean')
+    return err(c, 'VALIDATION', 'disabled (boolean) or plan required');
+  const disabled = body.disabled;
   const updated = await accounts.updateAccount(target.id, (cur) => ({
     ...cur,
     disabled,
@@ -247,6 +268,44 @@ opsRoutes.delete('/families/:id', async (c) => {
 });
 
 // ---------- usage ----------
+
+/** Compensation for a gate that judged wrongly: drop one account's counters for one month.
+ *  Nothing else can undo a quota refusal, and the counters carry no user content. */
+opsRoutes.delete('/usage/:id/:month', async (c) => {
+  const id = c.req.param('id');
+  const month = c.req.param('month');
+  if (!store.validYearMonth(month)) return err(c, 'VALIDATION', 'month must be YYYY-MM');
+  const target = await accounts.getAccount(id);
+  if (!target) return err(c, 'NOT_FOUND', 'account not found');
+  const existed = await usage.resetUsage(id, month);
+  audit(c.get('operator'), 'usage.reset', target.username, month);
+  return c.json({ ok: true, existed });
+});
+
+/** The deployment's authorization: who it is licensed to, until when, and what it may grant.
+ *  Reported even when absent, because "demo mode" is otherwise silent after boot. */
+opsRoutes.get('/license', async (c) => {
+  const info = license;
+  const expiresAt = info?.expiresAt ?? null;
+  const daysLeft = expiresAt
+    ? Math.floor((Date.parse(expiresAt) - Date.now()) / 86_400_000)
+    : null;
+  return c.json({
+    licensed: info !== null,
+    licensee: info?.licensee ?? null,
+    edition: info?.edition ?? null,
+    issuedAt: info?.issuedAt ?? null,
+    expiresAt,
+    daysLeft,
+    /** warn window: a token inside 30 days of expiry stops the whole deployment when it lapses */
+    expiringSoon: daysLeft !== null && daysLeft <= 30,
+    seats: seatLimit(),
+    accounts: await accounts.countAccounts(),
+    plans: grantablePlans(),
+    quotas: PLANS,
+    demoMode: info === null,
+  });
+});
 
 opsRoutes.get('/usage', async (c) => {
   const month = c.req.query('month');

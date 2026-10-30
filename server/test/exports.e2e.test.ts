@@ -41,7 +41,10 @@ test('memory exports: share card and annual book', { timeout: 180_000 }, async (
     t.skip('export fonts not fetched (run scripts/fetch-fonts.sh)');
     return;
   }
-  const server = await startServer(5);
+  // The annual book is a paid feature, and an unlicensed harness starts accounts on `free`.
+  // Grant it through the console, the same path an operator would use.
+  const OPS_TOKEN = 'ops-bootstrap-token-exports';
+  const server = await startServer(5, { OPS_BOOTSTRAP_TOKEN: OPS_TOKEN });
   try {
     const boot = await json(server.base, '/api/v1/auth/bootstrap', {
       method: 'POST',
@@ -49,6 +52,19 @@ test('memory exports: share card and annual book', { timeout: 180_000 }, async (
     });
     assert.equal(boot.response.status, 200);
     const owner = auth(boot.body.accessToken);
+
+    const opsBoot = await json(server.base, '/api/ops/auth/bootstrap', {
+      method: 'POST',
+      body: JSON.stringify({ token: OPS_TOKEN, username: 'boss', password: 'ops-password-secret-1' }),
+    });
+    assert.equal(opsBoot.response.status, 201);
+    const granted = await json(server.base, `/api/ops/accounts/${boot.body.user.id}`, {
+      method: 'PATCH',
+      headers: auth(opsBoot.body.token),
+      body: JSON.stringify({ plan: 'standard' }),
+    });
+    assert.equal(granted.response.status, 200);
+    assert.equal(granted.body.user.plan, 'standard');
     const reg = await json(server.base, '/api/v1/auth/register', {
       method: 'POST',
       body: JSON.stringify({

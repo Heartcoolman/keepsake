@@ -14,7 +14,13 @@ import * as people from '../people.ts';
 import * as annual from '../annual.ts';
 import { fontsReady, renderCard } from '../exports/render.ts';
 import { err } from './errors.ts';
-import { requireKeys, requireAiEntitlement, userRateLimit, type AppEnv } from './middleware.ts';
+import {
+  requireKeys,
+  requireAiEntitlement,
+  requireAnnualExport,
+  userRateLimit,
+  type AppEnv,
+} from './middleware.ts';
 import { SSE_HEADERS, v1Frame } from './sse.ts';
 
 export const exportsRoutes = new Hono<AppEnv>();
@@ -80,68 +86,75 @@ exportsRoutes.get('/exports/card/:id', userRateLimit(30), async (c) => {
 
 /** POST { year } → SSE progress stream while the book renders; the finished PDF is
  *  parked in RAM for a short window and fetched via GET /exports/annual/:year/file. */
-exportsRoutes.post('/exports/annual', annualBodyLimit, userRateLimit(4), requireAiEntitlement, async (c) => {
-  if (!(await fontsReady())) return err(c, 'UNAVAILABLE', 'export fonts missing');
-  let year: number;
-  try {
-    const body = (await c.req.json()) as { year?: unknown };
-    year = Number(body.year);
-  } catch {
-    return err(c, 'VALIDATION', 'invalid JSON');
-  }
-  if (!Number.isInteger(year) || year < 2000 || year > 2099)
-    return err(c, 'VALIDATION', 'bad year');
+exportsRoutes.post(
+  '/exports/annual',
+  annualBodyLimit,
+  userRateLimit(4),
+  requireAnnualExport,
+  requireAiEntitlement,
+  async (c) => {
+    if (!(await fontsReady())) return err(c, 'UNAVAILABLE', 'export fonts missing');
+    let year: number;
+    try {
+      const body = (await c.req.json()) as { year?: unknown };
+      year = Number(body.year);
+    } catch {
+      return err(c, 'VALIDATION', 'invalid JSON');
+    }
+    if (!Number.isInteger(year) || year < 2000 || year > 2099)
+      return err(c, 'VALIDATION', 'bad year');
 
-  const account = c.get('account');
-  const source: annual.AnnualSource = {
-    accountId: account.id,
-    displayName: account.displayName || account.username,
-    scopeId: accounts.scopeIdOf(account),
-    udk: keyring.getUdk(account.id)!,
-    scopeKey: keyring.getScopeKey(accounts.scopeIdOf(account)),
-    year,
-  };
-  // cheap pre-checks answer as plain errors, not a stream that dies immediately
-  if (!(await annual.yearEntries(source)).length)
-    return err(c, 'VALIDATION', 'no entries this year');
-  if (!annual.startJob(account.id, year)) return err(c, 'CONFLICT', 'already generating');
+    const account = c.get('account');
+    const source: annual.AnnualSource = {
+      accountId: account.id,
+      displayName: account.displayName || account.username,
+      scopeId: accounts.scopeIdOf(account),
+      udk: keyring.getUdk(account.id)!,
+      scopeKey: keyring.getScopeKey(accounts.scopeIdOf(account)),
+      year,
+    };
+    // cheap pre-checks answer as plain errors, not a stream that dies immediately
+    if (!(await annual.yearEntries(source)).length)
+      return err(c, 'VALIDATION', 'no entries this year');
+    if (!annual.startJob(account.id, year)) return err(c, 'CONFLICT', 'already generating');
 
-  const signal = c.req.raw.signal;
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const send = (obj: unknown) => {
-        try {
-          controller.enqueue(v1Frame(obj));
-        } catch {
-          /* stream already closed */
-        }
-      };
-      void (async () => {
-        try {
-          const result = await annual.generateAnnual(source, signal, (p) =>
-            send({ type: 'progress', step: p.step, total: p.total, label: p.label }),
-          );
-          annual.finishJob(account.id, year, result.pdf, result.pages);
-          send({ type: 'done', year, pages: result.pages, bytes: result.pdf.length });
-        } catch (e) {
-          annual.finishJob(account.id, year, null);
-          const code = (e as { code?: string }).code;
-          if (code !== 'ABORTED') {
-            console.error('[v1] annual export failed', e);
-            send({ type: 'error', code: 'INTERNAL', message: 'annual export failed' });
-          }
-        } finally {
+    const signal = c.req.raw.signal;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const send = (obj: unknown) => {
           try {
-            controller.close();
+            controller.enqueue(v1Frame(obj));
           } catch {
-            /* already closed */
+            /* stream already closed */
           }
-        }
-      })();
-    },
-  });
-  return new Response(stream, { headers: SSE_HEADERS });
-});
+        };
+        void (async () => {
+          try {
+            const result = await annual.generateAnnual(source, signal, (p) =>
+              send({ type: 'progress', step: p.step, total: p.total, label: p.label }),
+            );
+            annual.finishJob(account.id, year, result.pdf, result.pages);
+            send({ type: 'done', year, pages: result.pages, bytes: result.pdf.length });
+          } catch (e) {
+            annual.finishJob(account.id, year, null);
+            const code = (e as { code?: string }).code;
+            if (code !== 'ABORTED') {
+              console.error('[v1] annual export failed', e);
+              send({ type: 'error', code: 'INTERNAL', message: 'annual export failed' });
+            }
+          } finally {
+            try {
+              controller.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        })();
+      },
+    });
+    return new Response(stream, { headers: SSE_HEADERS });
+  },
+);
 
 exportsRoutes.get('/exports/annual/:year/file', async (c) => {
   const year = Number(c.req.param('year'));
