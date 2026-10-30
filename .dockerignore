@@ -23,3 +23,11 @@ scripts
 da3-eval
 matting-eval
 parsing-data
+# retired inference weights — the matting line accumulated 141MB of superseded
+# exports that shipped in every image. Their training checkpoints are archived
+# (core/docs/model-archive.md §6.2), so the ONNX can be re-exported if needed.
+# Recurring guard against new dead weight: the /ops model tab marks any file in
+# server/models/ that no code path resolves as `orphan`.
+server/models/matting-v1.onnx
+server/models/matting-v2.onnx
+server/models/matting-v3.onnx
