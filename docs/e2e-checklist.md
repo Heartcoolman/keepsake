@@ -82,7 +82,7 @@ Lint 剩余 10 个提示：8 个依赖有新版、目标 SDK 35 不是本机最�
 
 上节记录停在 2026-07-19。此后新增的功能列于本节。服务端侧多数已由自动化测试覆盖，标注 ✅ 的无需人工重复；标注 ☐ 的需要真机或人眼判断。
 
-最后一次自动化验证：2026-08-24（P5 收敛与计费之后），`pnpm typecheck` 0 错误，`pnpm test` 55 项中 54 通过、1 项因选中私有 core 而跳过（跳过原因直接打印在 `node --test` 输出里）。独立版 `:app:testDebugUnitTest` 136 项 0 失败、5 跳过（跳过为需真密钥/网络的 live 测试）。
+最后一次自动化验证：2026-10-30（发布提交 `9dda3b5` / core `f6e7245`），`pnpm typecheck` 0 错误，`pnpm test` 55 项中 54 通过、1 项因选中私有 core 而跳过；独立版 `:app:testDebugUnitTest` 136 项 0 失败、5 跳过（跳过为需真密钥/网络的 live 测试）。此前的 2026-08-24 一轮数字相同。
 
 本节所有 ☐ 项的逐步操作指引见私有仓 `core/docs/acceptance-20260824.md`（含独立版与 Apple 端验收）。
 
@@ -159,10 +159,14 @@ memory 记录的遗留项，是本轮优先级最高的验收内容。
 
 ## 一次性核对（命令即判据，无需真机）
 
-- ✅ 独立版 release APK 不含密钥：`unzip -p app-release.apk classes.dex | strings | grep -cE 'sk-[A-Za-z0-9]{20,}'` → 0
+2026-10-30 在发布提交 `9dda3b5` / core `f6e7245` 上重跑，全部通过：
+
+- ✅ 独立版 release APK 不含密钥：解包后 `strings classes.dex` 中 `sk-[A-Za-z0-9]{20,}` 命中 0、`LLM_API_KEY` 符号命中 0；`api.moonshot.cn` 命中 2（默认接口地址，非机密）
 - ✅ 配置面三处一致：`./scripts/check-env-parity.sh` → `env parity OK (22 个变量,三处一致)`
-- ✅ 孤儿权重清零：`/ops` 模型页签无 `orphan` 标记（matting v1/v2/v3 已删，`server/models` 559M → 424M）
-- ✅ 两个 Android 工程 `lintDebug` 0 错误（此前各有 1 个：NAS 缺 `ACCESS_NETWORK_STATE`、独立版 `setIsStrongBoxBacked` 的 NewApi）
+- ✅ 公仓索引无私有内容特征：`./scripts/check-leaks.sh` → `OK`
+- ✅ 孤儿权重清零：`server/models` 424M，matting v1/v2/v3 已不存在
+- ✅ 全部构建通过：`pnpm typecheck` 0 错误；`pnpm test` 55 项 54 通过 1 跳过；客户端 `pnpm build` 成功；独立版 `assembleRelease` 成功且产物已签名；`testDebugUnitTest` 136 项 0 失败 5 跳过
+- ✅ 两个 Android 工程 `lintDebug` 0 错误（NAS 缺 `ACCESS_NETWORK_STATE`、独立版 `setIsStrongBoxBacked` 的 NewApi 两项已修并复跑）
 
 ## 需真机或人眼判断
 
