@@ -181,3 +181,5 @@ xcodebuild -project Nianxiang.xcodeproj -scheme Nianxiang -destination 'platform
 ## License
 
 代码以 [Elastic License 2.0](LICENSE)（source-available）发布：可自由查阅、修改、自托管，但不得作为托管服务对第三方提供，不得绕过授权校验功能。第三方模型许可见 [NOTICE](NOTICE)。`core/` 私有子模块保留所有权利。
+
+Installed on 2026-11-01
